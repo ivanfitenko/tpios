@@ -82,6 +82,44 @@ func (s *Switch) login() error {
 	return lastErr
 }
 
+// loginRejectedError means the switch answered (HTTP-level success) but
+// explicitly refused the credentials/session - as opposed to a network or
+// device-availability failure. This must never be retried automatically
+// (there's no point retrying a wrong password) and must never be treated
+// as a successful login.
+type loginRejectedError struct{ code int }
+
+func (e *loginRejectedError) Error() string { return "login rejected: " + loginErrTypeMessage(e.code) }
+
+// loginErrTypeMessage decodes this device's logonInfo[0] error code, taken
+// from the login page's own JS (window.onload's errType handling).
+func loginErrTypeMessage(code int) string {
+	switch code {
+	case 1:
+		return "incorrect username or password"
+	case 2:
+		return "this user is not allowed to log in"
+	case 3, 4:
+		return "too many users are already logged in to this switch"
+	case 5:
+		return "session timed out"
+	case 6:
+		return "this account still has the factory-default password; tpios doesn't support the forced password-change flow the web UI requires - change the password via the web UI first"
+	default:
+		return fmt.Sprintf("unrecognized error code %d", code)
+	}
+}
+
+var logonInfoRe = regexp.MustCompile(`logonInfo\s*=\s*new\s*Array\(\s*([0-9]+)`)
+
+// doLogin posts the credentials and inspects the response body for the
+// device's own success/failure signal (logonInfo[0]) - a plain HTTP 200 here
+// does NOT mean the login succeeded; the device always answers 200 and just
+// re-renders the login page with an error code on bad credentials. Trusting
+// the HTTP status alone was the root cause of a bug where a wrong password
+// silently "succeeded" and every subsequent page fetch quietly returned the
+// login page instead of real data, which parsed as all-empty - rendering
+// every port as "down".
 func (s *Switch) doLogin() error {
 	form := url.Values{"username": {s.user}, "password": {s.pass}, "logon": {"Login"}}
 	req, err := http.NewRequest("POST", s.base+"/logon.cgi", strings.NewReader(form.Encode()))
@@ -97,7 +135,15 @@ func (s *Switch) doLogin() error {
 		return fmt.Errorf("switch did not respond to login (device may be slow/overloaded): %w", err)
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if m := logonInfoRe.FindStringSubmatch(string(body)); m != nil {
+		if code, _ := strconv.Atoi(m[1]); code != 0 {
+			return &loginRejectedError{code: code}
+		}
+	}
 	return nil
 }
 
@@ -1510,26 +1556,43 @@ func main() {
 	}
 	ip := flag.Arg(0)
 
-	user, err := readline.Line("Username: ")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "input error:", err)
-		os.Exit(1)
-	}
-	user = strings.TrimSpace(user)
+	const maxLoginAttempts = 3
+	var sw *Switch
+	for attempt := 1; ; attempt++ {
+		user, err := readline.Line("Username: ")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "input error:", err)
+			os.Exit(1)
+		}
+		user = strings.TrimSpace(user)
 
-	passBytes, err := readline.Password("Password: ")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "input error:", err)
-		os.Exit(1)
-	}
-	pass := strings.TrimSpace(string(passBytes))
+		passBytes, err := readline.Password("Password: ")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "input error:", err)
+			os.Exit(1)
+		}
+		pass := strings.TrimSpace(string(passBytes))
 
-	sw := NewSwitch(ip, user, pass, *portNum)
+		sw = NewSwitch(ip, user, pass, *portNum)
+		fmt.Printf("Connecting to %s ...\n", ip)
+		err = sw.login()
+		if err == nil {
+			break
+		}
 
-	fmt.Printf("Connecting to %s ...\n", ip)
-	if err := sw.login(); err != nil {
-		fmt.Fprintln(os.Stderr, "Could not reach/login to", sw.base, "-", err)
-		os.Exit(1)
+		var rejected *loginRejectedError
+		if !errors.As(err, &rejected) {
+			// Not a credential rejection (network/device-availability issue) -
+			// re-asking for a password won't help, so just report and exit.
+			fmt.Fprintln(os.Stderr, "Could not reach/login to", sw.base, "-", err)
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, "%", err)
+		if attempt >= maxLoginAttempts {
+			fmt.Fprintln(os.Stderr, "Too many failed login attempts.")
+			os.Exit(1)
+		}
+		fmt.Println()
 	}
 
 	hostname := "Switch"
