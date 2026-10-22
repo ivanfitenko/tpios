@@ -2071,12 +2071,41 @@ func (c *CLI) dispatchShow(args []string) {
 	}
 }
 
+// resolveAbbrev expands cmd to the one top-level candidate it's an
+// unambiguous prefix of, reusing completionCandidates (the same list Tab
+// already completes against) rather than requiring every command to have
+// its abbreviations hand-enumerated as extra case labels. That hand
+// enumeration is how "en"/"ena"/"enab"/"enable" all ended up working while
+// "description" and "end" (in config-if mode, abbreviated as "en") didn't -
+// nobody had added their short forms. Ambiguous or no-match prefixes are
+// returned unchanged, so the existing "% Unknown command" handling still
+// fires correctly - this only ever resolves a command that would already
+// Tab-complete cleanly to exactly one thing.
+func resolveAbbrev(mode Mode, cmd string) string {
+	for _, cand := range completionCandidates(mode, nil) {
+		if cand == cmd {
+			return cmd
+		}
+	}
+	match, count := "", 0
+	for _, cand := range completionCandidates(mode, nil) {
+		if strings.HasPrefix(cand, cmd) {
+			match = cand
+			count++
+		}
+	}
+	if count == 1 {
+		return match
+	}
+	return cmd
+}
+
 func (c *CLI) handleLine(line string) (quit bool) {
 	fields := strings.Fields(line)
 	if len(fields) == 0 {
 		return false
 	}
-	cmd := lc(fields[0])
+	cmd := resolveAbbrev(c.mode, lc(fields[0]))
 	args := fields[1:]
 
 	switch c.mode {
