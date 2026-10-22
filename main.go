@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -563,6 +564,35 @@ func (s *Switch) fetchLoopPrevention() (bool, error) {
 	return extractVar(html, "lpEn") == "1", nil
 }
 
+// setLoopPrevention was verified live with a same-value no-op before being
+// trusted for the config-restore feature below.
+func (s *Switch) setLoopPrevention(enabled bool) error {
+	v := 0
+	if enabled {
+		v = 1
+	}
+	_, err := s.get(fmt.Sprintf("loop_prevention_set.cgi?lpEn=%d", v))
+	return err
+}
+
+// setIPSetting was verified live end-to-end: changing to a different static
+// IP in the same subnet took effect immediately with no reboot (the device
+// stopped answering on the old address and started on the new one), and
+// switching back to DHCP got the same lease back. Note this means a replay
+// that changes the IP/DHCP setting WILL make the current connection stale -
+// callers must detect that and stop issuing further requests on this
+// Switch rather than let them time out confusingly against a dead address.
+func (s *Switch) setIPSetting(dhcp bool, ip, mask, gateway string) error {
+	v := "disable"
+	if dhcp {
+		v = "enable"
+	}
+	path := fmt.Sprintf("ip_setting.cgi?dhcpSetting=%s&ip_address=%s&ip_netmask=%s&ip_gateway=%s",
+		v, url.QueryEscape(ip), url.QueryEscape(mask), url.QueryEscape(gateway))
+	_, err := s.get(path)
+	return err
+}
+
 type LagGroup struct {
 	ID    int
 	Ports []int
@@ -592,6 +622,177 @@ func (s *Switch) fetchLAG() ([]LagGroup, error) {
 	return groups, nil
 }
 
+// --------------------------------------------------------- config backup/restore --
+//
+// This device has no "running-config" vs "startup-config" distinction of its
+// own - every change is written to flash immediately. tpios fakes the
+// distinction locally: "write memory" / "copy running-config startup-config"
+// dumps the exact text `show running-config` produces to a local file;
+// "copy startup-config running-config" reads it back and replays it against
+// the device, the way a real switch loads its startup-config at boot. tpios
+// also does that replay automatically at connect time if a backup exists for
+// this switch's MAC, matching how real hardware behaves - not something it
+// asks permission for, same as a real switch doesn't ask either.
+//
+// The parser below understands only tpios's own output, not arbitrary Cisco
+// config syntax - that's deliberate: we don't need to parse everything IOS
+// could show, just reliably round-trip what we ourselves generate.
+
+func configDir() (string, error) {
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		return filepath.Join(xdg, "tpios"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "tpios"), nil
+}
+
+// backupConfigPath is keyed by MAC, not IP - this switch's IP can come from
+// DHCP (and tpios can now change it via replay), so MAC is the only stable
+// identity across sessions.
+func backupConfigPath(mac string) (string, error) {
+	dir, err := configDir()
+	if err != nil {
+		return "", err
+	}
+	safe := strings.ToUpper(strings.NewReplacer(":", "", "-", "").Replace(mac))
+	if safe == "" {
+		safe = "unknown"
+	}
+	return filepath.Join(dir, safe+".cfg"), nil
+}
+
+type PortTarget struct {
+	Shutdown       bool
+	SpeedCfg       int // 1 = Auto, the default
+	FlowControl    int
+	Mode           string // "access", "trunk", or ""
+	AccessVlan     int
+	TrunkVlans     []int
+	Description    string
+	HasDescription bool
+	pendingSpeed   string // holds "speed" until the following "duplex" line completes the pair
+}
+
+type ConfigTarget struct {
+	Hostname       string
+	HasIP          bool
+	DHCP           bool
+	IPAddr         string
+	IPMask         string
+	IPGateway      string
+	LoopPrevention bool
+	VlanNames      map[int]string
+	Ports          map[int]*PortTarget
+}
+
+// parseConfigText understands exactly the dialect buildRunningConfig emits:
+// unindented top-level directives and block headers ("hostname X", "vlan N",
+// "interface GigabitEthernet0/N"), one-space-indented lines inside a block,
+// and "!" or a blank line closing the current block.
+func parseConfigText(text string) *ConfigTarget {
+	cfg := &ConfigTarget{VlanNames: map[int]string{}, Ports: map[int]*PortTarget{}}
+	var curPort *PortTarget
+	var curVlanID int
+	inVlan := false
+
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		indented := strings.HasPrefix(line, " ")
+
+		if trimmed == "" || trimmed == "!" {
+			inVlan = false
+			curPort = nil
+			continue
+		}
+
+		switch {
+		case !indented && strings.HasPrefix(trimmed, "hostname "):
+			cfg.Hostname = strings.TrimPrefix(trimmed, "hostname ")
+		case !indented && strings.HasPrefix(trimmed, "ip address "):
+			cfg.HasIP = true
+			rest := strings.TrimPrefix(trimmed, "ip address ")
+			if rest == "dhcp" {
+				cfg.DHCP = true
+			} else if parts := strings.Fields(rest); len(parts) >= 2 {
+				cfg.IPAddr, cfg.IPMask = parts[0], parts[1]
+			}
+		case !indented && strings.HasPrefix(trimmed, "ip default-gateway "):
+			cfg.IPGateway = strings.TrimPrefix(trimmed, "ip default-gateway ")
+		case !indented && trimmed == "loop-detection":
+			cfg.LoopPrevention = true
+		case !indented && strings.HasPrefix(trimmed, "vlan "):
+			if n, err := strconv.Atoi(strings.TrimPrefix(trimmed, "vlan ")); err == nil {
+				curVlanID = n
+				inVlan = true
+				if _, ok := cfg.VlanNames[n]; !ok {
+					cfg.VlanNames[n] = fmt.Sprintf("VLAN%d", n)
+				}
+			}
+		case inVlan && indented && strings.HasPrefix(trimmed, "name "):
+			cfg.VlanNames[curVlanID] = strings.TrimPrefix(trimmed, "name ")
+		case !indented && strings.HasPrefix(trimmed, "interface GigabitEthernet0/"):
+			if n, err := strconv.Atoi(strings.TrimPrefix(trimmed, "interface GigabitEthernet0/")); err == nil {
+				curPort = &PortTarget{SpeedCfg: 1}
+				cfg.Ports[n] = curPort
+			}
+		case !indented && strings.HasPrefix(trimmed, "interface Port-channel"):
+			// LAG blocks are informational only - no write support, skip.
+		case curPort != nil && indented:
+			switch {
+			case trimmed == "shutdown":
+				curPort.Shutdown = true
+			case strings.HasPrefix(trimmed, "speed "):
+				curPort.pendingSpeed = strings.TrimPrefix(trimmed, "speed ")
+			case strings.HasPrefix(trimmed, "duplex "):
+				curPort.SpeedCfg = parseSpeedDuplex(curPort.pendingSpeed, strings.TrimPrefix(trimmed, "duplex "))
+			case trimmed == "flowcontrol on":
+				curPort.FlowControl = 1
+			case trimmed == "switchport mode trunk":
+				curPort.Mode = "trunk"
+			case strings.HasPrefix(trimmed, "switchport trunk allowed vlan "):
+				curPort.Mode = "trunk"
+				for _, v := range strings.Split(strings.TrimPrefix(trimmed, "switchport trunk allowed vlan "), ",") {
+					if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+						curPort.TrunkVlans = append(curPort.TrunkVlans, n)
+					}
+				}
+			case strings.HasPrefix(trimmed, "switchport access vlan "):
+				if n, err := strconv.Atoi(strings.TrimPrefix(trimmed, "switchport access vlan ")); err == nil {
+					curPort.Mode = "access"
+					curPort.AccessVlan = n
+				}
+			case strings.HasPrefix(trimmed, "description "):
+				curPort.Description = strings.TrimPrefix(trimmed, "description ")
+				curPort.HasDescription = true
+			}
+		}
+	}
+	return cfg
+}
+
+// parseSpeedDuplex is the inverse of speedLabel/duplexLabel.
+func parseSpeedDuplex(speed, duplex string) int {
+	switch speed {
+	case "10":
+		if duplex == "half" {
+			return 2
+		}
+		return 3
+	case "100":
+		if duplex == "half" {
+			return 4
+		}
+		return 5
+	case "1000":
+		return 6
+	default:
+		return 1 // auto
+	}
+}
+
 // ---------------------------------------------------------------------- CLI --
 
 type Mode int
@@ -605,13 +806,18 @@ const (
 )
 
 type CLI struct {
-	sw           *Switch
-	mode         Mode
-	hostname     string
-	curIf        int
-	curVlan      int
-	pendingNames map[int]string // vlan id -> name chosen before it has any port member (device can't persist an empty vlan)
-	out          *bufio.Writer
+	sw            *Switch
+	mode          Mode
+	hostname      string
+	curIf         int
+	curVlan       int
+	pendingNames  map[int]string // vlan id -> name chosen before it has any port member (device can't persist an empty vlan)
+	descriptions  map[int]string // port -> description; this device has no field for it, so it only ever lives here and in the backup file
+	mac           string         // identifies the backup file for this switch (backupConfigPath)
+	connectIP     string         // the IP this session dialed - used to detect a replay changing it out from under us
+	out           *bufio.Writer
+	rl            *readline.Instance // needed for the "copy start run" confirm prompt
+	exitRequested bool               // set when a replay changes the IP/DHCP setting and this session's connection is now stale
 }
 
 func vlanDisplayName(vt *VlanTable, pending map[int]string, vid int) string {
@@ -731,7 +937,7 @@ func (c *CLI) showIntStatus() {
 		c.println("%", err)
 		return
 	}
-	c.printf("%-10s %-12s %-6s %-7s %-5s %s\n", "Port", "Status", "Vlan", "Duplex", "Speed", "Type")
+	c.printf("%-10s %-20s %-12s %-6s %-7s %-5s %s\n", "Port", "Name", "Status", "Vlan", "Duplex", "Speed", "Type")
 	for p := 1; p <= c.sw.portNum; p++ {
 		st := at(ps.State, p)
 		act := at(ps.SpdAct, p)
@@ -749,7 +955,11 @@ func (c *CLI) showIntStatus() {
 		if act != 0 {
 			dup, spd = duplexLabel(act), speedLabel(act)
 		}
-		c.printf("Gi0/%-6d %-12s %-6s %-7s %-5s %s\n", p, status, vlan, dup, spd, "10/100/1000BaseTX")
+		name := c.descriptions[p]
+		if len(name) > 20 { // real IOS hard-truncates this column too
+			name = name[:20]
+		}
+		c.printf("Gi0/%-6d %-20s %-12s %-6s %-7s %-5s %s\n", p, name, status, vlan, dup, spd, "10/100/1000BaseTX")
 	}
 }
 
@@ -796,12 +1006,24 @@ func (c *CLI) renderIntDetail(ps *PortSettings, stats *PortStats, mac string, po
 		lineState, status = "up", "connected"
 	}
 	c.printf("GigabitEthernet0/%d is %s, line protocol is %s (%s)\n", port, adminState, lineState, status)
+	if desc, ok := c.descriptions[port]; ok && desc != "" {
+		c.printf("  Description: %s\n", desc)
+	}
 	c.printf("  Hardware is Gigabit Ethernet, address is %s (bia %s)\n", mac, mac)
 	c.println("  MTU 1500 bytes, BW 1000000 Kbit/sec, DLY 10 usec,")
 	c.println("     reliability 255/255, txload 1/255, rxload 1/255")
 	c.println("  Encapsulation ARPA, loopback not set")
 	c.println("  Keepalive not supported")
-	c.printf("  %s, media type is 10/100/1000BaseTX\n", speedDuplexPhrase(cfg))
+	// Once a link is up, show what it actually negotiated to, not the
+	// configured policy - real IOS reports the negotiation outcome here,
+	// and "Auto-duplex, Auto-speed" would otherwise silently hide a
+	// degraded link (e.g. fallen back to 100Mb/s half-duplex) on any port
+	// left at the default Auto setting, which is nearly all of them.
+	speedDuplexCode := cfg
+	if act != 0 {
+		speedDuplexCode = act
+	}
+	c.printf("  %s, media type is 10/100/1000BaseTX\n", speedDuplexPhrase(speedDuplexCode))
 	fcState := "off"
 	if fc == 1 {
 		fcState = "on"
@@ -862,75 +1084,77 @@ func (c *CLI) showIntAll() {
 	}
 }
 
-func (c *CLI) showRunningConfig() {
+// buildRunningConfig is the single source of truth for tpios's Cisco-dialect
+// config text - used by `show running-config`, `write memory` (which saves
+// this exact text to the local backup file), and implicitly round-tripped by
+// parseConfigText when that file is loaded back. Keep this and
+// parseConfigText in sync: anything added here that should survive a
+// save/restore cycle needs a matching case there.
+func (c *CLI) buildRunningConfig() (string, error) {
 	ps, err := c.sw.fetchPortSettings()
 	if err != nil {
-		c.println("%", err)
-		return
+		return "", err
 	}
 	vt, err := c.sw.fetchVlans()
 	if err != nil {
-		c.println("%", err)
-		return
+		return "", err
 	}
 	pvids, err := c.sw.fetchPVIDs()
 	if err != nil {
-		c.println("%", err)
-		return
+		return "", err
 	}
 	ipset, err := c.sw.fetchIPSetting()
 	if err != nil {
-		c.println("%", err)
-		return
+		return "", err
 	}
 	igmp, err := c.sw.fetchIgmpSnooping()
 	if err != nil {
-		c.println("%", err)
-		return
+		return "", err
 	}
 	loopPrev, err := c.sw.fetchLoopPrevention()
 	if err != nil {
-		c.println("%", err)
-		return
+		return "", err
 	}
 	lag, err := c.sw.fetchLAG()
 	if err != nil {
-		c.println("%", err)
-		return
+		return "", err
 	}
 
-	c.println("Building configuration...")
-	c.println()
-	c.println("Current configuration:")
-	c.println("!")
-	c.printf("hostname %s\n", c.hostname)
-	c.println("!")
+	var b strings.Builder
+	fmt.Fprintln(&b, "Building configuration...")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "Current configuration:")
+	fmt.Fprintln(&b, "!")
+	fmt.Fprintf(&b, "hostname %s\n", c.hostname)
+	fmt.Fprintln(&b, "!")
 	if ipset.DHCP {
-		c.println("ip address dhcp")
+		fmt.Fprintln(&b, "ip address dhcp")
 	} else {
-		c.printf("ip address %s %s\n", ipset.IP, ipset.Mask)
+		fmt.Fprintf(&b, "ip address %s %s\n", ipset.IP, ipset.Mask)
 		if ipset.Gateway != "" {
-			c.printf("ip default-gateway %s\n", ipset.Gateway)
+			fmt.Fprintf(&b, "ip default-gateway %s\n", ipset.Gateway)
 		}
 	}
 	if igmp {
-		c.println("ip igmp snooping")
+		// Read-only in tpios - "copy start run" does not write this back.
+		fmt.Fprintln(&b, "ip igmp snooping")
 	}
 	if loopPrev {
 		// Not a real Cisco IOS command - this switch's "Loop Prevention"
 		// toggle has no exact IOS equivalent. Named for plausibility; see
-		// concerns.md.
-		c.println("loop-detection")
+		// concerns.md. Unlike igmp snooping, this one IS written back by
+		// "copy start run" (setLoopPrevention).
+		fmt.Fprintln(&b, "loop-detection")
 	}
-	c.println("!")
+	fmt.Fprintln(&b, "!")
 	if vt.Enabled {
 		for _, v := range vt.Vlans {
 			if v.ID == 1 {
 				continue
 			}
-			c.printf("vlan %d\n", v.ID)
-			c.printf(" name %s\n", v.Name)
-			c.println("!")
+			fmt.Fprintf(&b, "vlan %d\n", v.ID)
+			fmt.Fprintf(&b, " name %s\n", v.Name)
+			fmt.Fprintln(&b, "!")
 		}
 	}
 	for _, g := range lag {
@@ -938,21 +1162,24 @@ func (c *CLI) showRunningConfig() {
 		for _, p := range g.Ports {
 			members = append(members, fmt.Sprintf("Gi0/%d", p))
 		}
-		c.printf("interface Port-channel%d\n", g.ID)
-		c.printf(" ! members: %s\n", strings.Join(members, ", "))
-		c.println("!")
+		fmt.Fprintf(&b, "interface Port-channel%d\n", g.ID)
+		fmt.Fprintf(&b, " ! members: %s\n", strings.Join(members, ", "))
+		fmt.Fprintln(&b, "!")
 	}
 	for p := 1; p <= c.sw.portNum; p++ {
-		c.printf("interface GigabitEthernet0/%d\n", p)
+		fmt.Fprintf(&b, "interface GigabitEthernet0/%d\n", p)
+		if desc, ok := c.descriptions[p]; ok && desc != "" {
+			fmt.Fprintf(&b, " description %s\n", desc)
+		}
 		if at(ps.State, p) == 0 {
-			c.println(" shutdown")
+			fmt.Fprintln(&b, " shutdown")
 		}
 		if cfg := at(ps.SpdCfg, p); cfg != 1 { // 1 == Auto, the default
-			c.printf(" speed %s\n", speedLabel(cfg))
-			c.printf(" duplex %s\n", duplexLabel(cfg))
+			fmt.Fprintf(&b, " speed %s\n", speedLabel(cfg))
+			fmt.Fprintf(&b, " duplex %s\n", duplexLabel(cfg))
 		}
 		if at(ps.FcCfg, p) == 1 { // off is the default
-			c.println(" flowcontrol on")
+			fmt.Fprintln(&b, " flowcontrol on")
 		}
 		vlan := portVlanDisplay(vt, pvids, p)
 		if vlan == "trunk" {
@@ -963,16 +1190,259 @@ func (c *CLI) showRunningConfig() {
 					allowed = append(allowed, strconv.Itoa(v.ID))
 				}
 			}
-			c.println(" switchport mode trunk")
+			fmt.Fprintln(&b, " switchport mode trunk")
 			if len(allowed) > 0 {
-				c.printf(" switchport trunk allowed vlan %s\n", strings.Join(allowed, ","))
+				fmt.Fprintf(&b, " switchport trunk allowed vlan %s\n", strings.Join(allowed, ","))
 			}
 		} else if vlan != "1" {
-			c.printf(" switchport access vlan %s\n", vlan)
+			fmt.Fprintf(&b, " switchport access vlan %s\n", vlan)
 		}
-		c.println("!")
+		fmt.Fprintln(&b, "!")
 	}
-	c.println("end")
+	fmt.Fprintln(&b, "end")
+	return b.String(), nil
+}
+
+func (c *CLI) showRunningConfig() {
+	text, err := c.buildRunningConfig()
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+	c.out.WriteString(text)
+	c.out.Flush()
+}
+
+// saveConfig is "write memory" / "copy running-config startup-config" - the
+// first real action either of those has ever done in tpios (previously just
+// a canned "this device auto-persists" message, which is true of the device
+// but says nothing about the local backup file).
+func (c *CLI) saveConfig() {
+	text, err := c.buildRunningConfig()
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+	path, err := backupConfigPath(c.mac)
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		c.println("%", err)
+		return
+	}
+	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+		c.println("%", err)
+		return
+	}
+	c.println("Building configuration...")
+	c.printf("[OK] (saved to %s)\n", path)
+}
+
+// applyIPSetting pushes an IP/DHCP change, filling in any blank field (a
+// dhcp line, or a bare "ip default-gateway" command, carries no address of
+// its own) from the device's current settings first. Returns whether the
+// connection on c.sw might now be stale - see the isDialError comment below
+// for why an error from the write itself still has to be treated as "maybe
+// changed" rather than "didn't change". Shared by config replay and the
+// interactive "ip address"/"ip default-gateway" commands.
+// dhcp == nil means "keep whatever the device is currently set to" - used
+// by "ip default-gateway", which must not force the device into static
+// mode as a side effect of only touching the gateway.
+func (c *CLI) applyIPSetting(dhcp *bool, ip, mask, gateway string) (changed bool) {
+	// Reading current state first also lets a real DHCP<->static
+	// transition (connection-breaking) be told apart from reapplying the
+	// mode the device is already in (a no-op that still has to make the
+	// cgi call, but must NOT be reported as having changed the IP - that
+	// false positive used to make the boot-time loader quit immediately on
+	// every switch already on DHCP, even though nothing changed).
+	cur, curErr := c.sw.fetchIPSetting()
+	effectiveDHCP := dhcp != nil && *dhcp
+	if curErr == nil {
+		if dhcp == nil {
+			effectiveDHCP = cur.DHCP
+		}
+		if ip == "" {
+			ip = cur.IP
+		}
+		if mask == "" {
+			mask = cur.Mask
+		}
+		if gateway == "" {
+			gateway = cur.Gateway
+		}
+	}
+	if err := c.sw.setIPSetting(effectiveDHCP, ip, mask, gateway); err != nil {
+		c.println("%", err)
+		// Verified live: this specific call can time out client-side while
+		// still succeeding on the device moments later (same slow-write
+		// pattern documented for qvlan_en/device description in
+		// concerns.md, now confirmed for IP too). A dial-stage error means
+		// the request never reached the device, so nothing could have
+		// changed; anything else is ambiguous, and for an IP-changing call
+		// "ambiguous" must be treated as "assume changed" - letting the
+		// session continue against a connection that might already be dead
+		// is worse than an extra reconnect prompt.
+		return !isDialError(err)
+	}
+	if curErr != nil {
+		// Couldn't read the prior state to compare against - assume the
+		// connection might now be stale rather than silently continuing to
+		// hammer a possibly-dead address.
+		return true
+	}
+	return effectiveDHCP != cur.DHCP || (!effectiveDHCP && ip != "" && ip != cur.IP)
+}
+
+// applyConfigTarget pushes a parsed config at the device, reusing the exact
+// same methods the interactive commands use (switchportAccess and friends),
+// so a replay behaves identically to someone typing the equivalent commands
+// by hand. Returns true if the IP/DHCP setting was changed, which means
+// every further request on c.sw will fail - callers must stop immediately
+// and tell the user to reconnect rather than let subsequent calls time out
+// confusingly against a now-dead address.
+func (c *CLI) applyConfigTarget(cfg *ConfigTarget) (ipChanged bool) {
+	if c.descriptions == nil {
+		c.descriptions = map[int]string{}
+	}
+	for p, pt := range cfg.Ports {
+		if pt.HasDescription {
+			c.descriptions[p] = pt.Description
+		}
+	}
+
+	if cfg.Hostname != "" && cfg.Hostname != c.hostname {
+		if err := c.sw.setDeviceDescription(cfg.Hostname); err != nil {
+			c.println("%", err)
+		} else {
+			c.hostname = cfg.Hostname
+		}
+	}
+
+	// Pre-seed pendingNames so vlan auto-creation during switchport calls
+	// below picks up the intended name instead of defaulting to "VLANxxx".
+	if c.pendingNames == nil {
+		c.pendingNames = map[int]string{}
+	}
+	for id, name := range cfg.VlanNames {
+		c.pendingNames[id] = name
+	}
+	// Rename any of those vlans that already exist with a different name.
+	if vt, err := c.sw.fetchVlans(); err == nil {
+		for id, name := range cfg.VlanNames {
+			if v := vt.byID(id); v != nil && v.Name != name {
+				if err := c.sw.writeVlan(id, name, v.UntagMask, v.TagMask); err != nil {
+					c.println("%", err)
+				}
+			}
+		}
+	}
+
+	if err := c.sw.setLoopPrevention(cfg.LoopPrevention); err != nil {
+		c.println("%", err)
+	}
+
+	// Read current port state so we can skip calls that would just reapply
+	// what's already there. This matters beyond efficiency: reapplying
+	// port_setting.cgi - even with unchanged values - can cause a brief PHY
+	// renegotiation, and if that port happens to be the one carrying this
+	// very management connection (very plausibly port 1, since that's
+	// commonly the uplink port), the resulting HTTP response can be delayed
+	// past our timeout. Observed live: a full replay consistently timed out
+	// applying port 1's (already-correct) settings until this skip was added.
+	curPS, _ := c.sw.fetchPortSettings()
+
+	ports := make([]int, 0, len(cfg.Ports))
+	for p := range cfg.Ports {
+		ports = append(ports, p)
+	}
+	sort.Ints(ports)
+	for _, p := range ports {
+		pt := cfg.Ports[p]
+		switch pt.Mode {
+		case "access":
+			c.switchportAccess(p, pt.AccessVlan)
+		case "trunk":
+			for _, v := range pt.TrunkVlans {
+				c.switchportTrunkAdd(p, v)
+			}
+		}
+		enabled := 1
+		if pt.Shutdown {
+			enabled = 0
+		}
+		if curPS != nil && at(curPS.State, p) == enabled && at(curPS.SpdCfg, p) == pt.SpeedCfg && at(curPS.FcCfg, p) == pt.FlowControl {
+			continue // already matches - skip the call entirely
+		}
+		if err := c.sw.setPortState(p, enabled, pt.SpeedCfg, pt.FlowControl); err != nil {
+			c.printf("%% port %d: %s\n", p, err)
+		}
+	}
+
+	if cfg.HasIP {
+		if c.applyIPSetting(&cfg.DHCP, cfg.IPAddr, cfg.IPMask, cfg.IPGateway) {
+			ipChanged = true
+		}
+	}
+	return ipChanged
+}
+
+// applyFromFile reads and replays path, returning whether the connection is
+// now stale (see applyConfigTarget).
+func (c *CLI) applyFromFile(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		c.println("%", err)
+		return false
+	}
+	return c.applyConfigTarget(parseConfigText(string(data)))
+}
+
+// bootLoadIfPresent is the boot-time equivalent of a real switch loading its
+// startup-config - unconditional, no confirmation, silent if there's simply
+// nothing saved yet for this switch (the normal first-ever-connection case).
+func (c *CLI) bootLoadIfPresent() {
+	path, err := backupConfigPath(c.mac)
+	if err != nil {
+		return
+	}
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	c.printf("Loading backup configuration from %s...\n", path)
+	if c.applyFromFile(path) {
+		c.println("The switch's IP/DHCP setting just changed - this connection is now stale.")
+		c.println("Reconnect once you know the new address.")
+		c.exitRequested = true
+	}
+}
+
+// copyStartToRun is the explicit "copy startup-config running-config"
+// command - unlike bootLoadIfPresent, this happens mid-session on purpose,
+// so it asks for confirmation first (it can silently undo live changes made
+// since the backup was last saved).
+func (c *CLI) copyStartToRun() {
+	path, err := backupConfigPath(c.mac)
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+	if _, err := os.Stat(path); err != nil {
+		c.printf("%% No backup found at %s\n", path)
+		return
+	}
+	c.printf("This will apply the configuration saved in %s to this switch. Continue? [confirm] ", path)
+	line, _ := c.rl.Readline()
+	if strings.TrimSpace(line) != "" {
+		c.println("Aborted.")
+		return
+	}
+	if c.applyFromFile(path) {
+		c.println("The switch's IP/DHCP setting just changed - this connection is now stale.")
+		c.println("Reconnect once you know the new address.")
+		c.exitRequested = true
+	}
 }
 
 // This hardware silently no-ops any VLAN create/update where every port is submitted
@@ -1070,6 +1540,7 @@ func (c *CLI) printHelp() {
   enable | disable
   configure terminal
     interface gigabitEthernet0/<1-N>
+      description <text> / no description
       shutdown / no shutdown
       switchport mode {access|trunk}
       switchport access vlan <id>
@@ -1082,6 +1553,8 @@ func (c *CLI) printHelp() {
       name <name>
       exit / end
     no vlan <id>
+    ip address {dhcp|<address> <mask>}
+    ip default-gateway <address>
     hostname <name>
     exit / end
   show version
@@ -1089,7 +1562,8 @@ func (c *CLI) printHelp() {
   show interfaces status
   show interface gigabitEthernet0/<n>
   show running-config
-  write memory | copy running-config startup-config
+  write memory | copy running-config startup-config  (saves to a local backup file, keyed by MAC)
+  copy startup-config running-config                 (replays that file onto this switch)
   clear counters
   exit / logout
 Tab completes commands; a line ending in "?" lists what can come next.`)
@@ -1162,10 +1636,23 @@ func (c *CLI) handleLine(line string) (quit bool) {
 		case "sh", "show":
 			c.dispatchShow(args)
 		case "wr", "write":
-			c.println("Building configuration...")
-			c.println("[OK] (note: this device auto-persists each change; there is no separate running/startup config)")
+			if a0 := lc(arg(args, 0)); a0 != "" && a0 != "memory" && a0 != "mem" {
+				c.println("% Usage: write memory")
+				break
+			}
+			c.saveConfig()
 		case "copy":
-			c.println("[OK] (note: this device auto-persists each change; there is no separate running/startup config)")
+			src, dst := lc(arg(args, 0)), lc(arg(args, 1))
+			isRun := func(s string) bool { return s == "running-config" || s == "run" }
+			isStart := func(s string) bool { return s == "startup-config" || s == "start" }
+			switch {
+			case isRun(src) && isStart(dst):
+				c.saveConfig()
+			case isStart(src) && isRun(dst):
+				c.copyStartToRun()
+			default:
+				c.println("% Usage: copy running-config startup-config | copy startup-config running-config")
+			}
 		case "reload":
 			c.println("Proceed with reload? [confirm]")
 			c.println("% reload is disabled in tpios for safety - power-cycle the switch physically if needed")
@@ -1240,6 +1727,38 @@ func (c *CLI) handleLine(line string) (quit bool) {
 			} else {
 				c.println("% Unknown 'no' command in config mode")
 			}
+		case "ip":
+			switch lc(arg(args, 0)) {
+			case "address":
+				var dhcp bool
+				var ip, mask string
+				if lc(arg(args, 1)) == "dhcp" {
+					dhcp = true
+				} else if arg(args, 2) != "" {
+					ip, mask = arg(args, 1), arg(args, 2)
+				} else {
+					c.println("% Usage: ip address dhcp | ip address <address> <mask>")
+					break
+				}
+				if c.applyIPSetting(&dhcp, ip, mask, "") {
+					c.println("The switch's IP/DHCP setting just changed - this connection is now stale.")
+					c.println("Reconnect once you know the new address.")
+					c.exitRequested = true
+				}
+			case "default-gateway":
+				gw := arg(args, 1)
+				if gw == "" {
+					c.println("% Usage: ip default-gateway <address>")
+					break
+				}
+				if c.applyIPSetting(nil, "", "", gw) {
+					c.println("The switch's IP/DHCP setting just changed - this connection is now stale.")
+					c.println("Reconnect once you know the new address.")
+					c.exitRequested = true
+				}
+			default:
+				c.println("% Usage: ip address {dhcp|<address> <mask>} | ip default-gateway <address>")
+			}
 		case "hostname":
 			name := arg(args, 0)
 			if name == "" {
@@ -1265,6 +1784,15 @@ func (c *CLI) handleLine(line string) (quit bool) {
 
 	case ModeConfigIf:
 		switch cmd {
+		case "description":
+			if len(args) == 0 {
+				c.println("% Usage: description <text>")
+				break
+			}
+			if c.descriptions == nil {
+				c.descriptions = map[int]string{}
+			}
+			c.descriptions[c.curIf] = strings.Join(args, " ")
 		case "shutdown":
 			ps, err := c.sw.fetchPortSettings()
 			if err != nil {
@@ -1306,6 +1834,8 @@ func (c *CLI) handleLine(line string) (quit bool) {
 				default:
 					c.println("% Usage: no switchport access vlan <id> | no switchport trunk allowed vlan <id>")
 				}
+			case "description":
+				delete(c.descriptions, c.curIf)
 			default:
 				c.println("% Unknown 'no' command in interface mode")
 			}
@@ -1456,9 +1986,9 @@ func completionCandidates(mode Mode, precedingFields []string) []string {
 		case ModePriv:
 			return []string{"configure", "show", "write", "copy", "clear", "reload", "disable", "exit", "logout", "help"}
 		case ModeConfig:
-			return []string{"interface", "vlan", "no", "hostname", "do", "exit", "end", "help"}
+			return []string{"interface", "vlan", "no", "ip", "hostname", "do", "exit", "end", "help"}
 		case ModeConfigIf:
-			return []string{"shutdown", "no", "switchport", "speed", "flowcontrol", "exit", "end", "help"}
+			return []string{"description", "shutdown", "no", "switchport", "speed", "flowcontrol", "exit", "end", "help"}
 		case ModeConfigVlan:
 			return []string{"name", "shutdown", "no", "exit", "end", "help"}
 		}
@@ -1468,6 +1998,13 @@ func completionCandidates(mode Mode, precedingFields []string) []string {
 	switch {
 	case (first == "show" || first == "sh") && len(precedingFields) == 1:
 		return []string{"version", "vlan", "interfaces", "interface", "running-config"}
+	case (first == "show" || first == "sh") && len(precedingFields) == 2 &&
+		(lc(precedingFields[1]) == "int" || lc(precedingFields[1]) == "interface" || lc(precedingFields[1]) == "interfaces"):
+		// Real IOS also lists interface-type keywords here (GigabitEthernet,
+		// Vlan, Port-channel, ...) that you'd keep typing a specific number
+		// onto - skipped here since our completer assumes complete,
+		// space-terminated words, and a bare number prefix doesn't fit that.
+		return []string{"status"}
 	case (first == "configure" || first == "conf") && len(precedingFields) == 1:
 		return []string{"terminal"}
 	case first == "switchport" && len(precedingFields) == 1:
@@ -1477,7 +2014,7 @@ func completionCandidates(mode Mode, precedingFields []string) []string {
 	case first == "no" && len(precedingFields) == 1 && mode == ModeConfig:
 		return []string{"vlan"}
 	case first == "no" && len(precedingFields) == 1 && mode == ModeConfigIf:
-		return []string{"shutdown", "switchport"}
+		return []string{"shutdown", "switchport", "description"}
 	case first == "speed" && len(precedingFields) == 1:
 		return []string{"auto", "10", "100", "1000"}
 	case first == "flowcontrol" && len(precedingFields) == 1:
@@ -1486,6 +2023,16 @@ func completionCandidates(mode Mode, precedingFields []string) []string {
 		return []string{"show"}
 	case first == "clear" && len(precedingFields) == 1:
 		return []string{"counters"}
+	case first == "copy" && len(precedingFields) == 1:
+		return []string{"running-config", "startup-config"}
+	case first == "copy" && len(precedingFields) == 2 && lc(precedingFields[1]) == "running-config":
+		return []string{"startup-config"}
+	case first == "copy" && len(precedingFields) == 2 && lc(precedingFields[1]) == "startup-config":
+		return []string{"running-config"}
+	case first == "ip" && len(precedingFields) == 1:
+		return []string{"address", "default-gateway"}
+	case first == "ip" && len(precedingFields) == 2 && lc(precedingFields[1]) == "address":
+		return []string{"dhcp"}
 	}
 	return nil
 }
@@ -1596,21 +2143,47 @@ func main() {
 	}
 
 	hostname := "Switch"
-	if si, err := sw.fetchSysInfo(); err == nil && si.Desc != "" {
-		hostname = si.Desc
+	mac := ""
+	if si, err := sw.fetchSysInfo(); err == nil {
+		if si.Desc != "" {
+			hostname = si.Desc
+		}
+		mac = si.MAC
 	}
 
-	cli := &CLI{sw: sw, mode: ModeUser, hostname: hostname}
+	cli := &CLI{sw: sw, mode: ModeUser, hostname: hostname, mac: mac, connectIP: ip}
 
 	var histFile string
 	if home, err := os.UserHomeDir(); err == nil {
 		histFile = filepath.Join(home, ".tpios_history")
 	}
 
-	rl, err := readline.NewEx(&readline.Config{
+	// Real IOS shows "?" help the instant the key is pressed, no Enter
+	// needed. chzyer/readline's Listener fires after the key is already
+	// inserted into the buffer, so we strip it back out, print the help,
+	// and force a redraw - rl is assigned just below, but by the time this
+	// closure actually runs (on a real keypress) it's long since set.
+	var rl *readline.Instance
+	qListener := readline.FuncListener(func(line []rune, pos int, key rune) ([]rune, int, bool) {
+		if key != '?' || pos < 1 {
+			return nil, 0, false
+		}
+		before := append([]rune{}, line[:pos-1]...)
+		before = append(before, line[pos:]...)
+		fmt.Fprintln(cli.out)
+		cli.showLineHelp(string(before))
+		if rl != nil {
+			rl.Refresh()
+		}
+		return before, pos - 1, true
+	})
+
+	var err error
+	rl, err = readline.NewEx(&readline.Config{
 		Prompt:       cli.prompt() + " ",
 		HistoryFile:  histFile,
 		AutoComplete: &cliCompleter{cli: cli},
+		Listener:     qListener,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "readline init failed:", err)
@@ -1618,15 +2191,23 @@ func main() {
 	}
 	defer rl.Close()
 	cli.out = bufio.NewWriter(rl.Stdout())
+	cli.rl = rl
+
+	defer sw.logout()
+
+	// Mirrors a real switch loading its own startup-config at boot - no
+	// confirmation, silent if nothing has been saved yet for this MAC.
+	cli.bootLoadIfPresent()
+	if cli.exitRequested {
+		return
+	}
 
 	fmt.Fprintln(rl.Stdout())
 	fmt.Fprintln(rl.Stdout(), "User Access Verification")
 	fmt.Fprintln(rl.Stdout())
-	fmt.Fprintf(rl.Stdout(), "%s con0 is now available\n", hostname)
+	fmt.Fprintf(rl.Stdout(), "%s con0 is now available\n", cli.hostname)
 	fmt.Fprintln(rl.Stdout(), "Press RETURN to get started.")
 	fmt.Fprintln(rl.Stdout())
-
-	defer sw.logout()
 
 	for {
 		rl.SetPrompt(cli.prompt() + " ")
@@ -1643,7 +2224,7 @@ func main() {
 			cli.showLineHelp(strings.TrimSuffix(line, "?"))
 			continue
 		}
-		if cli.handleLine(line) {
+		if cli.handleLine(line) || cli.exitRequested {
 			break
 		}
 	}

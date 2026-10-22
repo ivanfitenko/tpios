@@ -6,9 +6,7 @@ entire generation learned on then-world-leding gear, and that the rest of the
 networking world unjustly left behind.
 
 There is no API on these switches. tpios drives the same `*.cgi`/`*.htm`
-endpoints the device's own web UI uses. See [`concerns.md`](concerns.md)
-for everything that's fragile, simplified, or unverified about that -
-read it before relying on this for anything that matters.
+endpoints the device's own web UI uses.
 
 ## Build
 
