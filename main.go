@@ -1533,14 +1533,55 @@ func (c *CLI) buildRunningConfig() (string, error) {
 	return b.String(), nil
 }
 
+// reconcileBackupConfig fetches the actual, live config text (exactly what
+// buildRunningConfig computes right now) and compares it against the local
+// backup-config file - deliberately the local file even when "init storage"
+// is active, never flash. Flash is *expected* to lag behind - it only
+// updates on an explicit, confirmed "write memory", precisely to avoid a
+// reboot on every edit - so comparing against it here would flag that
+// designed-in gap as a "mismatch" on practically every show command, noise
+// rather than signal. The local file is the thing autoSaveLocal keeps
+// continuously current, so any difference from it is a genuine, unexpected
+// drift: a mutating command that missed an autosave call, another tpios
+// session or the device's own web UI changing something since, or simply
+// nothing saved yet. Either way the actual state is always the right thing
+// to show, and is self-healed into the local file. Shared by "show
+// running-config" and "show backup-config" so both commands apply the same
+// safety net.
+func (c *CLI) reconcileBackupConfig() (actual string, mismatch bool, err error) {
+	actual, err = c.buildRunningConfig()
+	if err != nil {
+		return "", false, err
+	}
+	var saved string
+	if path, perr := backupConfigPath(c.mac); perr == nil {
+		if data, rerr := os.ReadFile(path); rerr == nil {
+			saved = string(data)
+		}
+	}
+	if saved == actual {
+		return actual, false, nil
+	}
+	c.saveLocalCopy(actual)
+	return actual, true, nil
+}
+
+const mismatchNotice = "% Mismatch between the actual state and running configuration was detected, configuration updated"
+
 func (c *CLI) showRunningConfig() {
-	text, err := c.buildRunningConfig()
+	text, mismatch, err := c.reconcileBackupConfig()
 	if err != nil {
 		c.println("%", err)
 		return
 	}
+	if mismatch {
+		c.println(mismatchNotice)
+	}
 	c.out.WriteString(text)
 	c.out.Flush()
+	if mismatch {
+		c.println(mismatchNotice)
+	}
 }
 
 // printStartupConfigBail is what any command referencing "startup-config"
@@ -1556,29 +1597,25 @@ func (c *CLI) printStartupConfigBail() {
 // showBackupConfig is "show backup-config" - added specifically because
 // users expect "show startup-config" to let them peek at a saved config
 // without applying it, and on this platform that's backup-config's job.
+// It goes through the same reconcileBackupConfig path as "show
+// running-config" rather than reading the saved copy blindly: a stale
+// backup-config is never worth showing as if it were current, so a
+// mismatch here is self-healed (the local file, specifically - not flash,
+// see reconcileBackupConfig) and the actual state is shown either way.
 func (c *CLI) showBackupConfig() {
-	if c.storageActive() {
-		text, err := c.sw.readStoredConfig()
-		if err != nil {
-			c.println("%", err)
-			return
-		}
-		c.out.WriteString(text)
-		c.out.Flush()
-		return
-	}
-	path, err := backupConfigPath(c.mac)
+	text, mismatch, err := c.reconcileBackupConfig()
 	if err != nil {
 		c.println("%", err)
 		return
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		c.printf("%% No backup-config found (checked %s)\n", path)
-		return
+	if mismatch {
+		c.println(mismatchNotice)
 	}
-	c.out.Write(data)
+	c.out.WriteString(text)
 	c.out.Flush()
+	if mismatch {
+		c.println(mismatchNotice)
+	}
 }
 
 // autoSaveLocal writes the current config to the local backup-config file
@@ -1854,6 +1891,7 @@ func (c *CLI) bootLoadIfPresent() {
 				c.println("Reconnect once you know the new address.")
 				c.exitRequested = true
 			}
+			c.mergeLocalSessionState()
 			return
 		}
 	}
@@ -1874,6 +1912,52 @@ func (c *CLI) bootLoadFromFlash() {
 		c.println("The switch's IP/DHCP setting just changed - this connection is now stale.")
 		c.println("Reconnect once you know the new address.")
 		c.exitRequested = true
+	}
+	c.mergeLocalSessionState()
+}
+
+// mergeLocalSessionState overlays descriptions and pending VLAN names from
+// the local backup-config file on top of whatever bootLoadIfPresent/
+// bootLoadFromFlash just applied. These two fields have no home on the
+// device at all - not even in flash storage, until an explicit "write
+// memory" pushes them there too - while autoSaveLocal keeps the local file
+// current on every edit. That makes the local file always at least as fresh
+// as flash for exactly these two fields, even when flash is the primary,
+// device-resident source for everything else - without this, flash storage
+// being active meant any description/pending-VLAN-name edit since the last
+// "write memory" silently vanished on reconnect, the opposite of what
+// autoSaveLocal exists for. Called unconditionally after either boot-load
+// path, including the local-file path itself, where it's a harmless no-op
+// (it's reading the exact file that was just applied).
+func (c *CLI) mergeLocalSessionState() {
+	path, err := backupConfigPath(c.mac)
+	if err != nil {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	cfg := parseConfigText(string(data))
+
+	if c.descriptions == nil {
+		c.descriptions = map[int]string{}
+	}
+	for p, pt := range cfg.Ports {
+		if pt.HasDescription {
+			c.descriptions[p] = pt.Description
+		}
+	}
+
+	vt, vtErr := c.sw.fetchVlans()
+	if c.pendingNames == nil {
+		c.pendingNames = map[int]string{}
+	}
+	for id, name := range cfg.VlanNames {
+		if vtErr == nil && vt.byID(id) != nil {
+			continue // already a real VLAN on the device - not pending
+		}
+		c.pendingNames[id] = name
 	}
 }
 
@@ -2061,7 +2145,9 @@ func (c *CLI) switchportAccess(port, vid int) {
 	}
 	if err := c.sw.setPVID(port, vid); err != nil {
 		c.println("%", err)
+		return
 	}
+	c.autoSaveLocal()
 }
 
 func (c *CLI) switchportTrunkAdd(port, vid int) {
@@ -2087,6 +2173,7 @@ func (c *CLI) switchportTrunkAdd(port, vid int) {
 		return
 	}
 	delete(c.pendingNames, vid)
+	c.autoSaveLocal()
 }
 
 func (c *CLI) noSwitchportVlan(port, vid int) {
@@ -2105,7 +2192,9 @@ func (c *CLI) noSwitchportVlan(port, vid int) {
 	v.TagMask &^= bit
 	if err := c.sw.writeVlan(v.ID, v.Name, v.UntagMask, v.TagMask); err != nil {
 		c.println("%", err)
+		return
 	}
+	c.autoSaveLocal()
 }
 
 func (c *CLI) printHelp() {
@@ -2341,6 +2430,7 @@ func (c *CLI) handleLine(line string) (quit bool) {
 					if _, pending := c.pendingNames[vid]; pending {
 						delete(c.pendingNames, vid)
 						c.printf("VLAN %d deleted\n", vid)
+						c.autoSaveLocal()
 					} else {
 						c.printf("%% VLAN %d does not exist\n", vid)
 					}
@@ -2349,6 +2439,7 @@ func (c *CLI) handleLine(line string) (quit bool) {
 				} else {
 					delete(c.pendingNames, vid)
 					c.printf("VLAN %d deleted\n", vid)
+					c.autoSaveLocal()
 				}
 			} else {
 				c.println("% Unknown 'no' command in config mode")
@@ -2373,9 +2464,16 @@ func (c *CLI) handleLine(line string) (quit bool) {
 					break
 				}
 				if c.applyIPSetting(&dhcp, ip, mask, "") {
+					// The connection is now stale (we're still dialing the old
+					// address) - skip autoSaveLocal here, since every fetch it
+					// would make is doomed to fail/time out against a switch
+					// no longer listening there. The next successful connect
+					// (to the new address) captures this change fresh.
 					c.println("The switch's IP/DHCP setting just changed - this connection is now stale.")
 					c.println("Reconnect once you know the new address.")
 					c.exitRequested = true
+				} else {
+					c.autoSaveLocal()
 				}
 			case "default-gateway":
 				gw := arg(args, 1)
@@ -2387,6 +2485,8 @@ func (c *CLI) handleLine(line string) (quit bool) {
 					c.println("The switch's IP/DHCP setting just changed - this connection is now stale.")
 					c.println("Reconnect once you know the new address.")
 					c.exitRequested = true
+				} else {
+					c.autoSaveLocal()
 				}
 			default:
 				c.println("% Usage: ip address {dhcp|<address> <mask>} | ip default-gateway <address>")
@@ -2399,6 +2499,7 @@ func (c *CLI) handleLine(line string) (quit bool) {
 				c.println("%", err)
 			} else {
 				c.hostname = name
+				c.autoSaveLocal()
 			}
 		case "do":
 			if lc(arg(args, 0)) == "show" {
@@ -2436,6 +2537,7 @@ func (c *CLI) handleLine(line string) (quit bool) {
 				c.println("%", err)
 			} else {
 				c.printf("%%LINK-5-CHANGED: Interface GigabitEthernet0/%d, changed state to administratively down\n", c.curIf)
+				c.autoSaveLocal()
 			}
 		case "no":
 			switch lc(arg(args, 0)) {
@@ -2449,6 +2551,7 @@ func (c *CLI) handleLine(line string) (quit bool) {
 					c.println("%", err)
 				} else {
 					c.printf("%%LINK-3-UPDOWN: Interface GigabitEthernet0/%d, changed state to up\n", c.curIf)
+					c.autoSaveLocal()
 				}
 			case "switchport":
 				switch lc(arg(args, 1)) {
@@ -2532,6 +2635,8 @@ func (c *CLI) handleLine(line string) (quit bool) {
 			if code != 0 {
 				if err := c.sw.setPortState(c.curIf, at(ps.State, c.curIf), code, at(ps.FcCfg, c.curIf)); err != nil {
 					c.println("%", err)
+				} else {
+					c.autoSaveLocal()
 				}
 			}
 		case "flowcontrol":
@@ -2552,6 +2657,8 @@ func (c *CLI) handleLine(line string) (quit bool) {
 			}
 			if err := c.sw.setPortState(c.curIf, at(ps.State, c.curIf), at(ps.SpdCfg, c.curIf), fc); err != nil {
 				c.println("%", err)
+			} else {
+				c.autoSaveLocal()
 			}
 		case "exit":
 			c.mode = ModeConfig
@@ -2589,6 +2696,8 @@ func (c *CLI) handleLine(line string) (quit bool) {
 			}
 			if err := c.sw.writeVlan(c.curVlan, name, v.UntagMask, v.TagMask); err != nil {
 				c.println("%", err)
+			} else {
+				c.autoSaveLocal()
 			}
 		case "shutdown", "no":
 			c.println("% VLAN admin state is not configurable on this platform; ignored")
