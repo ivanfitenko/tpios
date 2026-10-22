@@ -630,14 +630,29 @@ func (s *Switch) fetchLAG() ([]LagGroup, error) {
 // --------------------------------------------------------- config backup/restore --
 //
 // This device has no "running-config" vs "startup-config" distinction of its
-// own - every change is written to flash immediately. tpios fakes the
-// distinction locally: "write memory" / "copy running-config startup-config"
-// dumps the exact text `show running-config` produces to a local file;
-// "copy startup-config running-config" reads it back and replays it against
-// the device, the way a real switch loads its startup-config at boot. tpios
-// also does that replay automatically at connect time if a backup exists for
-// this switch's MAC, matching how real hardware behaves - not something it
-// asks permission for, same as a real switch doesn't ask either.
+// own - every change is written to flash immediately, so "running-config" is
+// just whatever `show running-config` computes on demand; there is no
+// separate stored thing for it to name. tpios does NOT pretend otherwise: it
+// has no startup-config at all, and any command that references one bails
+// out explaining why and pointing at "backup-config" instead (see isStart
+// below). "backup-config" is tpios's own entity, not a device concept:
+// "write memory" / "copy running-config backup-config" dumps the exact text
+// `show running-config` produces to a local file (or this switch's own flash,
+// if "init storage" has claimed it); "copy backup-config running-config"
+// reads it back and replays it against the device, the way a real switch
+// loads its startup-config at boot. tpios also does that replay automatically
+// at connect time if a backup exists for this switch's MAC, matching how real
+// hardware behaves - not something it asks permission for, same as a real
+// switch doesn't ask either.
+//
+// A second wrinkle: a handful of fields (interface descriptions, and a VLAN
+// name set before any port is assigned to it) have nowhere on the device to
+// live at all - there's no CGI field for them. Those are kept in memory
+// (c.descriptions / c.pendingNames) and must be written to the local
+// backup-config file immediately on every change (autoSaveLocal), not just on
+// "write memory" - otherwise they silently vanish on reconnect, which breaks
+// the "everything else here already auto-persists" expectation this platform
+// otherwise holds.
 //
 // The parser below understands only tpios's own output, not arbitrary Cisco
 // config syntax - that's deliberate: we don't need to parse everything IOS
@@ -1245,6 +1260,39 @@ func (c *CLI) showIntStatus() {
 	}
 }
 
+// showIntDescriptions is "show interfaces description": real IOS's compact
+// Interface/Status/Protocol/Description table, distinct from "show
+// interfaces status" above - note real IOS's Status wording here ("up" /
+// "down" / "admin down") is shorter than "show ip interface brief"'s
+// "administratively down". This device has no higher-layer protocol state of
+// its own, so Protocol just mirrors Status.
+func (c *CLI) showIntDescriptions() {
+	ps, err := c.sw.fetchPortSettings()
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+	c.printf("%-18s %-14s %-10s %s\n", "Interface", "Status", "Protocol", "Description")
+	for p := 1; p <= c.sw.portNum; p++ {
+		st := at(ps.State, p)
+		act := at(ps.SpdAct, p)
+		var status string
+		switch {
+		case st == 0:
+			status = "admin down"
+		case act == 0:
+			status = "down"
+		default:
+			status = "up"
+		}
+		protocol := "down"
+		if status == "up" {
+			protocol = "up"
+		}
+		c.printf("%-18s %-14s %-10s %s\n", fmt.Sprintf("Gi0/%d", p), status, protocol, c.descriptions[p])
+	}
+}
+
 // speedDuplexPhrase matches real IOS's "show interfaces" wording for the
 // configured speed/duplex line: "Auto-duplex, Auto-speed" when the port is
 // set to auto-negotiate, else "<Full|Half>-duplex, <N>Mb/s" for a forced
@@ -1495,7 +1543,62 @@ func (c *CLI) showRunningConfig() {
 	c.out.Flush()
 }
 
-// saveConfig is "write memory" / "copy running-config startup-config" - the
+// printStartupConfigBail is what any command referencing "startup-config"
+// does on this platform: nothing, on purpose. This device writes
+// running-config to flash immediately, so there is no separate
+// startup-config to show, copy to, or copy from - pointing that out beats
+// silently treating it as an alias for something else.
+func (c *CLI) printStartupConfigBail() {
+	c.println("% This platform has no startup-config: running-config is written to the switch immediately, as it changes.")
+	c.println(`% Use "backup-config" instead - "write memory" / "copy running-config backup-config" to save, "copy backup-config running-config" to restore, "show backup-config" to view it.`)
+}
+
+// showBackupConfig is "show backup-config" - added specifically because
+// users expect "show startup-config" to let them peek at a saved config
+// without applying it, and on this platform that's backup-config's job.
+func (c *CLI) showBackupConfig() {
+	if c.storageActive() {
+		text, err := c.sw.readStoredConfig()
+		if err != nil {
+			c.println("%", err)
+			return
+		}
+		c.out.WriteString(text)
+		c.out.Flush()
+		return
+	}
+	path, err := backupConfigPath(c.mac)
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		c.printf("%% No backup-config found (checked %s)\n", path)
+		return
+	}
+	c.out.Write(data)
+	c.out.Flush()
+}
+
+// autoSaveLocal writes the current config to the local backup-config file
+// unconditionally, with no prompt and no device flash/reboot involved - used
+// right after mutating state that this device has nowhere of its own to
+// store (interface descriptions, pending VLAN names), so that state survives
+// a reconnect without requiring an explicit "write memory" first. Errors are
+// swallowed on purpose: this runs after every such edit, and a config built
+// from fresh device state is never as important as the edit the user is
+// actually performing. autoSaveLocal is a local-only safety net; "write
+// memory" remains the way to also push the same config to device flash.
+func (c *CLI) autoSaveLocal() {
+	text, err := c.buildRunningConfig()
+	if err != nil {
+		return
+	}
+	c.saveLocalCopy(text)
+}
+
+// saveConfig is "write memory" / "copy running-config backup-config" - the
 // first real action either of those has ever done in tpios (previously just
 // a canned "this device auto-persists" message, which is true of the device
 // but says nothing about the local backup file).
@@ -1806,11 +1909,11 @@ func (c *CLI) firstRunSetup() {
 	}
 }
 
-// copyStartToRun is the explicit "copy startup-config running-config"
+// copyBackupToRun is the explicit "copy backup-config running-config"
 // command - unlike bootLoadIfPresent, this happens mid-session on purpose,
 // so it asks for confirmation first (it can silently undo live changes made
 // since the backup was last saved).
-func (c *CLI) copyStartToRun() {
+func (c *CLI) copyBackupToRun() {
 	if c.storageActive() {
 		c.printf("This will apply the configuration stored in this switch's own flash. Continue? [confirm] ")
 		line, _ := c.rl.Readline()
@@ -1882,7 +1985,7 @@ func (c *CLI) initStorage() {
 	}
 	if _, ok := findStorageRegion(backup); ok {
 		c.println("This switch's flash storage is already initialized for tpios.")
-		c.println(`Use "write memory" or "copy running-config startup-config" to update it.`)
+		c.println(`Use "write memory" or "copy running-config backup-config" to update it.`)
 		return
 	}
 
@@ -2031,25 +2134,31 @@ func (c *CLI) printHelp() {
   show version
   show vlan [brief]
   show interfaces status
+  show interfaces description
   show interface gigabitEthernet0/<n>
   show running-config
-  write memory | copy running-config startup-config  (local backup file, unless "init storage" ran)
-  copy startup-config running-config                 (replays it onto this switch)
+  show backup-config
+  write memory | copy running-config backup-config    (local backup file, unless "init storage" ran)
+  copy backup-config running-config                    (replays it onto this switch)
   clear counters
   exit / logout
 Tab completes commands; a line ending in "?" lists what can come next.`)
 }
 
 func (c *CLI) dispatchShow(args []string) {
-	switch lc(arg(args, 0)) {
+	top := resolveAbbrevIn(completionCandidates(ModePriv, []string{"show"}), lc(arg(args, 0)))
+	switch top {
 	case "ver", "version":
 		c.showVersion()
 	case "vlan":
 		c.showVlan()
 	case "int", "interface", "interfaces":
-		switch lc(arg(args, 1)) {
+		sub := resolveAbbrevIn(completionCandidates(ModePriv, []string{"show", "interfaces"}), lc(arg(args, 1)))
+		switch sub {
 		case "status":
 			c.showIntStatus()
+		case "description":
+			c.showIntDescriptions()
 		case "":
 			// Real IOS: bare "show interfaces" means a detailed report for
 			// every interface, as opposed to the compact "show interfaces
@@ -2064,6 +2173,10 @@ func (c *CLI) dispatchShow(args []string) {
 		}
 	case "run", "running-config":
 		c.showRunningConfig()
+	case "backup", "backup-config":
+		c.showBackupConfig()
+	case "start", "startup-config":
+		c.printStartupConfigBail()
 	case "mac", "mac-address-table":
 		c.println("% This command is not supported on this platform.")
 	default:
@@ -2082,13 +2195,23 @@ func (c *CLI) dispatchShow(args []string) {
 // fires correctly - this only ever resolves a command that would already
 // Tab-complete cleanly to exactly one thing.
 func resolveAbbrev(mode Mode, cmd string) string {
-	for _, cand := range completionCandidates(mode, nil) {
+	return resolveAbbrevIn(completionCandidates(mode, nil), cmd)
+}
+
+// resolveAbbrevIn expands cmd to the one candidate in the given list it's an
+// unambiguous prefix of - the same logic resolveAbbrev applies to top-level
+// commands, but usable against any candidate list (e.g. completionCandidates
+// results for a sub-command position), since top-level words aren't the only
+// place users expect abbreviations to work. Ambiguous or no-match prefixes
+// are returned unchanged.
+func resolveAbbrevIn(candidates []string, cmd string) string {
+	for _, cand := range candidates {
 		if cand == cmd {
 			return cmd
 		}
 	}
 	match, count := "", 0
-	for _, cand := range completionCandidates(mode, nil) {
+	for _, cand := range candidates {
 		if strings.HasPrefix(cand, cmd) {
 			match = cand
 			count++
@@ -2144,14 +2267,17 @@ func (c *CLI) handleLine(line string) (quit bool) {
 		case "copy":
 			src, dst := lc(arg(args, 0)), lc(arg(args, 1))
 			isRun := func(s string) bool { return s == "running-config" || s == "run" }
+			isBackup := func(s string) bool { return s == "backup-config" || s == "backup" }
 			isStart := func(s string) bool { return s == "startup-config" || s == "start" }
 			switch {
-			case isRun(src) && isStart(dst):
+			case isStart(src) || isStart(dst):
+				c.printStartupConfigBail()
+			case isRun(src) && isBackup(dst):
 				c.saveConfig()
-			case isStart(src) && isRun(dst):
-				c.copyStartToRun()
+			case isBackup(src) && isRun(dst):
+				c.copyBackupToRun()
 			default:
-				c.println("% Usage: copy running-config startup-config | copy startup-config running-config")
+				c.println("% Usage: copy running-config backup-config | copy backup-config running-config")
 			}
 		case "reload":
 			c.println("Proceed with reload? [confirm]")
@@ -2299,6 +2425,7 @@ func (c *CLI) handleLine(line string) (quit bool) {
 				c.descriptions = map[int]string{}
 			}
 			c.descriptions[c.curIf] = strings.Join(args, " ")
+			c.autoSaveLocal()
 		case "shutdown":
 			ps, err := c.sw.fetchPortSettings()
 			if err != nil {
@@ -2342,6 +2469,7 @@ func (c *CLI) handleLine(line string) (quit bool) {
 				}
 			case "description":
 				delete(c.descriptions, c.curIf)
+				c.autoSaveLocal()
 			default:
 				c.println("% Unknown 'no' command in interface mode")
 			}
@@ -2455,6 +2583,7 @@ func (c *CLI) handleLine(line string) (quit bool) {
 					c.pendingNames = map[int]string{}
 				}
 				c.pendingNames[c.curVlan] = name
+				c.autoSaveLocal()
 				c.printf("%% Note: VLAN %d has no ports yet, so this switch can't store it until one is assigned (switchport access/trunk); name %q remembered for then\n", c.curVlan, name)
 				break
 			}
@@ -2503,14 +2632,14 @@ func completionCandidates(mode Mode, precedingFields []string) []string {
 	first := lc(precedingFields[0])
 	switch {
 	case (first == "show" || first == "sh") && len(precedingFields) == 1:
-		return []string{"version", "vlan", "interfaces", "interface", "running-config"}
+		return []string{"version", "vlan", "interfaces", "interface", "running-config", "backup-config", "startup-config"}
 	case (first == "show" || first == "sh") && len(precedingFields) == 2 &&
 		(lc(precedingFields[1]) == "int" || lc(precedingFields[1]) == "interface" || lc(precedingFields[1]) == "interfaces"):
 		// Real IOS also lists interface-type keywords here (GigabitEthernet,
 		// Vlan, Port-channel, ...) that you'd keep typing a specific number
 		// onto - skipped here since our completer assumes complete,
 		// space-terminated words, and a bare number prefix doesn't fit that.
-		return []string{"status"}
+		return []string{"status", "description"}
 	case (first == "configure" || first == "conf") && len(precedingFields) == 1:
 		return []string{"terminal"}
 	case first == "switchport" && len(precedingFields) == 1:
@@ -2530,9 +2659,11 @@ func completionCandidates(mode Mode, precedingFields []string) []string {
 	case first == "clear" && len(precedingFields) == 1:
 		return []string{"counters"}
 	case first == "copy" && len(precedingFields) == 1:
-		return []string{"running-config", "startup-config"}
+		return []string{"running-config", "backup-config", "startup-config"}
 	case first == "copy" && len(precedingFields) == 2 && lc(precedingFields[1]) == "running-config":
-		return []string{"startup-config"}
+		return []string{"backup-config", "startup-config"}
+	case first == "copy" && len(precedingFields) == 2 && lc(precedingFields[1]) == "backup-config":
+		return []string{"running-config"}
 	case first == "copy" && len(precedingFields) == 2 && lc(precedingFields[1]) == "startup-config":
 		return []string{"running-config"}
 	case first == "ip" && len(precedingFields) == 1:
