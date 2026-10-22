@@ -8,6 +8,14 @@ networking world unjustly left behind.
 There is no API on these switches. tpios drives the same `*.cgi`/`*.htm`
 endpoints the device's own web UI uses.
 
+## Persistent config
+
+tpios found an undocumented property of this switch's firmware that lets
+it save your configuration the "classic" way - inside the device itself,
+exactly where a real switch's startup-config belongs. On first run, you
+can opt out and keep it in a local file instead, following the XDG Base
+Directory standard.
+
 ## Build
 
 ```
