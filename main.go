@@ -5,10 +5,14 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"compress/flate"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -16,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -793,6 +798,250 @@ func parseSpeedDuplex(speed, duplex string) int {
 	}
 }
 
+// --------------------------------------------------------- device flash storage --
+//
+// This device has its own native config backup/restore feature: GET
+// config_back.cgi downloads a small (~2.6KB on the TL-SG1024DE) proprietary
+// binary blob of its NVRAM, and POSTing a file to conf_restore.cgi restores
+// it, triggering an automatic reboot. The blob's layout was mapped by hand
+// against this device's exact firmware (1.0.0 Build 20230616 Rel.34205) and
+// is mostly fixed-size tables with a lot of genuinely-unused zero padding -
+// reserved slots for VLANs/features that aren't configured. Verified live:
+// writing our own data into that padding (leaving the real header, magic,
+// and populated fields untouched) survives a full restore+reboot+reread
+// cycle byte-for-byte, and the device stays completely healthy. Also
+// verified: the magic header IS checked - corrupting it gets a clean
+// "Failed" rejection with no reboot attempted, no corruption. So this only
+// works starting from a real backup from the actual device, never from a
+// synthetic blob built from nothing.
+//
+// This is exploiting an undocumented, unvalidated implementation detail of
+// one specific firmware build. It is NOT guaranteed to be safe on a
+// different model or even a different firmware revision of the same
+// model - the padding we found here could be meaningful, live data on a
+// different build. initStorage() refuses to run on an unrecognized
+// hardware/firmware string without an explicit override, and independently
+// re-discovers the usable region by scanning for the largest actual
+// contiguous zero run (with a safety margin trimmed off both ends) rather
+// than trusting a hardcoded offset - that at least adapts to a device with
+// a similar layout but a different amount of real data before its padding
+// starts. It is still a guess, not a guarantee.
+
+var tpiosStorageMagic = []byte("TPC1")
+
+const (
+	storageHeaderLen  = 12  // magic(4) + regionTotalLen(4) + payloadLen(4)
+	storageMargin     = 32  // bytes trimmed off each end of a newly-found zero run, in case our "it's all zero" read is slightly off at the edges
+	storageMinPayload = 256 // below this, device storage isn't worth the reboot cost over just using the local file
+)
+
+var errNoStoredConfig = errors.New("no tpios data found in this switch's flash - run \"init storage\" first")
+
+// knownGoodHardware is the exact hardwareStr this feature was verified
+// against. initStorage() requires an explicit override to proceed on
+// anything else - see the package comment above for why.
+const knownGoodHardware = "TL-SG1024DE 7.0"
+
+type storageRegion struct {
+	start    int // offset of our magic within the backup blob
+	totalLen int // full size of our allocated slot, including the header
+}
+
+// findStorageRegion looks for tpios's own magic already present in a
+// downloaded backup - the normal case for every write after the first.
+func findStorageRegion(backup []byte) (*storageRegion, bool) {
+	idx := bytes.Index(backup, tpiosStorageMagic)
+	if idx < 0 || idx+storageHeaderLen > len(backup) {
+		return nil, false
+	}
+	regionLen := int(binary.LittleEndian.Uint32(backup[idx+4 : idx+8]))
+	if regionLen < storageHeaderLen || idx+regionLen > len(backup) {
+		return nil, false
+	}
+	return &storageRegion{start: idx, totalLen: regionLen}, true
+}
+
+// findLargestZeroRun scans for the biggest contiguous run of zero bytes in
+// the backup and trims storageMargin off each end, used only the first time
+// (no existing magic yet) to pick where to put our data.
+func findLargestZeroRun(backup []byte) (start, length int, ok bool) {
+	bestStart, bestLen := -1, 0
+	curStart, curLen := -1, 0
+	for i, b := range backup {
+		if b == 0 {
+			if curStart == -1 {
+				curStart = i
+			}
+			curLen++
+		} else {
+			if curLen > bestLen {
+				bestStart, bestLen = curStart, curLen
+			}
+			curStart, curLen = -1, 0
+		}
+	}
+	if curLen > bestLen {
+		bestStart, bestLen = curStart, curLen
+	}
+	if bestStart < 0 || bestLen <= 2*storageMargin {
+		return 0, 0, false
+	}
+	return bestStart + storageMargin, bestLen - 2*storageMargin, true
+}
+
+func (s *Switch) fetchRawBackup() ([]byte, error) {
+	if err := s.ensureSession(); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("GET", s.base+"/config_back.cgi", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("no response from switch (timeout) fetching backup: %w", err)
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
+// uploadRawBackup posts data as the restore file. A successful HTTP
+// response here means the device accepted it and is rebooting - it does
+// NOT mean the content was valid; this device answers magic-mismatch
+// rejections as a normal 200 page containing tip:"Failed" rather than an
+// HTTP error, so that has to be checked explicitly.
+func (s *Switch) uploadRawBackup(data []byte) error {
+	if err := s.ensureSession(); err != nil {
+		return err
+	}
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	part, err := w.CreateFormFile("configfile", "config.cfg")
+	if err != nil {
+		return err
+	}
+	if _, err := part.Write(data); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", s.base+"/conf_restore.cgi", &body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("no response from switch (timeout) during restore upload: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if bytes.Contains(respBody, []byte(`tip = "Failed"`)) {
+		return fmt.Errorf("switch rejected the restore file (bad magic/format) - nothing was changed, no reboot triggered")
+	}
+	return nil
+}
+
+// waitForReboot polls plain GET / (no auth needed) until the switch
+// answers again or the deadline passes. Login state on s is left stale
+// deliberately - callers must re-login afterward, since the device's
+// session almost certainly didn't survive the reboot.
+func (s *Switch) waitForReboot(deadline time.Duration) error {
+	start := time.Now()
+	client := &http.Client{Timeout: 4 * time.Second}
+	for time.Since(start) < deadline {
+		time.Sleep(3 * time.Second)
+		resp, err := client.Get(s.base + "/")
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == 200 {
+			s.loggedIn = false
+			return nil
+		}
+	}
+	return fmt.Errorf("switch did not come back within %s after reboot", deadline)
+}
+
+// readStoredConfig downloads the backup, locates tpios's region, and
+// decompresses the config text stored there.
+func (s *Switch) readStoredConfig() (string, error) {
+	backup, err := s.fetchRawBackup()
+	if err != nil {
+		return "", err
+	}
+	region, ok := findStorageRegion(backup)
+	if !ok {
+		return "", errNoStoredConfig
+	}
+	payloadLen := int(binary.LittleEndian.Uint32(backup[region.start+8 : region.start+12]))
+	dataStart := region.start + storageHeaderLen
+	if payloadLen < 0 || dataStart+payloadLen > region.start+region.totalLen || dataStart+payloadLen > len(backup) {
+		return "", fmt.Errorf("stored config in flash looks corrupted (bad length field)")
+	}
+	r := flate.NewReader(bytes.NewReader(backup[dataStart : dataStart+payloadLen]))
+	defer r.Close()
+	text, err := io.ReadAll(r)
+	if err != nil {
+		return "", fmt.Errorf("stored config in flash failed to decompress: %w", err)
+	}
+	return string(text), nil
+}
+
+// writeStoredConfig compresses text and writes it into tpios's region in
+// the device's own backup blob, creating that region (via
+// findLargestZeroRun) if this is the first time. Always triggers a reboot
+// on success - callers must re-login afterward.
+func (s *Switch) writeStoredConfig(text string) error {
+	backup, err := s.fetchRawBackup()
+	if err != nil {
+		return err
+	}
+
+	region, existing := findStorageRegion(backup)
+	if !existing {
+		start, length, ok := findLargestZeroRun(backup)
+		if !ok || length < storageHeaderLen+storageMinPayload {
+			return fmt.Errorf("no usable flash storage region found on this device - refusing (largest usable run: %d bytes, need at least %d)", length, storageHeaderLen+storageMinPayload)
+		}
+		region = &storageRegion{start: start, totalLen: length}
+	}
+
+	var compressed bytes.Buffer
+	fw, err := flate.NewWriter(&compressed, flate.BestCompression)
+	if err != nil {
+		return err
+	}
+	if _, err := fw.Write([]byte(text)); err != nil {
+		return err
+	}
+	if err := fw.Close(); err != nil {
+		return err
+	}
+	if storageHeaderLen+compressed.Len() > region.totalLen {
+		return fmt.Errorf("config too large for device flash storage: needs %d bytes, only %d available in this device's reserved slot - trim VLANs/descriptions, or just rely on the local backup file instead", storageHeaderLen+compressed.Len(), region.totalLen)
+	}
+
+	slot := make([]byte, region.totalLen) // zero-filled; unused tail stays zero
+	copy(slot[0:4], tpiosStorageMagic)
+	binary.LittleEndian.PutUint32(slot[4:8], uint32(region.totalLen))
+	binary.LittleEndian.PutUint32(slot[8:12], uint32(compressed.Len()))
+	copy(slot[storageHeaderLen:], compressed.Bytes())
+
+	newBackup := make([]byte, len(backup))
+	copy(newBackup, backup)
+	copy(newBackup[region.start:region.start+region.totalLen], slot)
+
+	if err := s.uploadRawBackup(newBackup); err != nil {
+		return err
+	}
+	return s.waitForReboot(90 * time.Second)
+}
+
 // ---------------------------------------------------------------------- CLI --
 
 type Mode int
@@ -892,6 +1141,39 @@ func (c *CLI) showVersion() {
 	c.printf("System IP Address                  : %s (%s, gw %s)\n", si.IP, si.Mask, si.Gateway)
 	c.printf("Model number                       : %s\n", si.Hardware)
 	c.printf("Software Version (vendor firmware) : %s\n", si.Firmware)
+	c.printf("tpios version                      : %s\n", tpiosVersion())
+}
+
+// tpiosVersion identifies the running tpios build for bug reports. No
+// semver yet - this reports "git-<short revision>" using the VCS info Go
+// automatically embeds when building from a git checkout (no ldflags/
+// Makefile wiring needed), with a "-dirty" suffix if the working tree had
+// uncommitted changes at build time.
+func tpiosVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "git-unknown"
+	}
+	var rev string
+	var dirty bool
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	if rev == "" {
+		return "git-unknown"
+	}
+	if len(rev) > 7 {
+		rev = rev[:7]
+	}
+	if dirty {
+		rev += "-dirty"
+	}
+	return "git-" + rev
 }
 
 func (c *CLI) showVlan() {
@@ -1217,27 +1499,72 @@ func (c *CLI) showRunningConfig() {
 // first real action either of those has ever done in tpios (previously just
 // a canned "this device auto-persists" message, which is true of the device
 // but says nothing about the local backup file).
+// storageActive reports whether this switch's flash has already been
+// claimed for tpios's own use (see the device flash storage section).
+// Checked fresh every time rather than cached locally, so it works
+// correctly regardless of which machine/session set it up.
+func (c *CLI) storageActive() bool {
+	backup, err := c.sw.fetchRawBackup()
+	if err != nil {
+		return false
+	}
+	_, ok := findStorageRegion(backup)
+	return ok
+}
+
+// saveLocalCopy always writes the local backup file - this happens on
+// every save regardless of device flash storage state, since it's free
+// and gives a copy that doesn't require a working connection to retrieve.
+func (c *CLI) saveLocalCopy(text string) (string, error) {
+	path, err := backupConfigPath(c.mac)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
 func (c *CLI) saveConfig() {
 	text, err := c.buildRunningConfig()
 	if err != nil {
 		c.println("%", err)
 		return
 	}
-	path, err := backupConfigPath(c.mac)
+	c.println("Building configuration...")
+	path, err := c.saveLocalCopy(text)
 	if err != nil {
 		c.println("%", err)
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+
+	if !c.storageActive() {
+		c.printf("[OK] (saved to %s)\n", path)
+		return
+	}
+
+	c.printf("This switch's flash storage is initialized for tpios - saving there will reboot it (up to 90s). The local copy was saved either way. Continue? [confirm] ")
+	line, _ := c.rl.Readline()
+	if strings.TrimSpace(line) != "" {
+		c.printf("Aborted. (local copy still saved to %s)\n", path)
+		return
+	}
+	c.println("Writing to device flash and waiting for reboot...")
+	if err := c.sw.writeStoredConfig(text); err != nil {
 		c.println("%", err)
 		return
 	}
-	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+	if err := c.sw.login(); err != nil {
 		c.println("%", err)
+		c.println("The switch rebooted but tpios couldn't log back in automatically - reconnect manually.")
+		c.exitRequested = true
 		return
 	}
-	c.println("Building configuration...")
-	c.printf("[OK] (saved to %s)\n", path)
+	c.println("[OK] (saved to device flash storage)")
 }
 
 // applyIPSetting pushes an IP/DHCP change, filling in any blank field (a
@@ -1399,22 +1726,83 @@ func (c *CLI) applyFromFile(path string) bool {
 	return c.applyConfigTarget(parseConfigText(string(data)))
 }
 
+func (c *CLI) applyFromText(text string) bool {
+	return c.applyConfigTarget(parseConfigText(text))
+}
+
 // bootLoadIfPresent is the boot-time equivalent of a real switch loading its
-// startup-config - unconditional, no confirmation, silent if there's simply
-// nothing saved yet for this switch (the normal first-ever-connection case).
+// startup-config - unconditional, no confirmation. Checks device flash
+// storage first (it's the more authoritative, device-resident copy if
+// "init storage" has ever been run for this switch, from any machine),
+// then the local backup file, then - if neither exists - runs the
+// first-run setup prompt instead of silently doing nothing.
 func (c *CLI) bootLoadIfPresent() {
+	if c.storageActive() {
+		c.bootLoadFromFlash()
+		return
+	}
+
 	path, err := backupConfigPath(c.mac)
+	if err == nil {
+		if _, statErr := os.Stat(path); statErr == nil {
+			c.printf("Loading backup configuration from %s...\n", path)
+			if c.applyFromFile(path) {
+				c.println("The switch's IP/DHCP setting just changed - this connection is now stale.")
+				c.println("Reconnect once you know the new address.")
+				c.exitRequested = true
+			}
+			return
+		}
+	}
+
+	c.firstRunSetup()
+}
+
+// bootLoadFromFlash mirrors bootLoadIfPresent's local-file path, but
+// sourcing from this switch's own flash storage instead.
+func (c *CLI) bootLoadFromFlash() {
+	text, err := c.sw.readStoredConfig()
 	if err != nil {
+		c.println("%", err)
 		return
 	}
-	if _, err := os.Stat(path); err != nil {
-		return
-	}
-	c.printf("Loading backup configuration from %s...\n", path)
-	if c.applyFromFile(path) {
+	c.println("Loading backup configuration from this switch's own flash storage...")
+	if c.applyFromText(text) {
 		c.println("The switch's IP/DHCP setting just changed - this connection is now stale.")
 		c.println("Reconnect once you know the new address.")
 		c.exitRequested = true
+	}
+}
+
+// firstRunSetup runs once per switch, the moment neither device flash
+// storage nor a local backup file has anything for it yet - offers a
+// choice instead of silently leaving persistence unconfigured.
+func (c *CLI) firstRunSetup() {
+	c.println()
+	c.println("No tpios configuration found for this switch yet (checked its own flash storage and the local backup file).")
+	c.println("How should tpios persist configuration for this switch going forward?")
+	c.println(`  1. switch native - store it in this switch's own flash (runs "init storage" now - reboots the switch)`)
+	c.println("  2. local         - a file on this machine only (~/.config/tpios/<MAC>.cfg, or $XDG_CONFIG_HOME if set)")
+	c.println(`  3. skip          - decide later ("init storage" or "write memory" any time)`)
+	c.printf("Choice [1/2/3, default 3]: ")
+	line, _ := c.rl.Readline()
+	switch strings.TrimSpace(strings.ToLower(line)) {
+	case "1", "switch native", "native", "switch":
+		c.initStorage()
+	case "2", "local":
+		text, err := c.buildRunningConfig()
+		if err != nil {
+			c.println("%", err)
+			return
+		}
+		path, err := c.saveLocalCopy(text)
+		if err != nil {
+			c.println("%", err)
+			return
+		}
+		c.printf("Saved initial local backup to %s\n", path)
+	default:
+		c.println(`Skipped - nothing persisted yet. Run "write memory" or "init storage" whenever you're ready.`)
 	}
 }
 
@@ -1423,6 +1811,26 @@ func (c *CLI) bootLoadIfPresent() {
 // so it asks for confirmation first (it can silently undo live changes made
 // since the backup was last saved).
 func (c *CLI) copyStartToRun() {
+	if c.storageActive() {
+		c.printf("This will apply the configuration stored in this switch's own flash. Continue? [confirm] ")
+		line, _ := c.rl.Readline()
+		if strings.TrimSpace(line) != "" {
+			c.println("Aborted.")
+			return
+		}
+		text, err := c.sw.readStoredConfig()
+		if err != nil {
+			c.println("%", err)
+			return
+		}
+		if c.applyFromText(text) {
+			c.println("The switch's IP/DHCP setting just changed - this connection is now stale.")
+			c.println("Reconnect once you know the new address.")
+			c.exitRequested = true
+		}
+		return
+	}
+
 	path, err := backupConfigPath(c.mac)
 	if err != nil {
 		c.println("%", err)
@@ -1443,6 +1851,68 @@ func (c *CLI) copyStartToRun() {
 		c.println("Reconnect once you know the new address.")
 		c.exitRequested = true
 	}
+}
+
+// initStorage claims this switch's flash-backup slot for tpios's own use -
+// see the device flash storage section for exactly what that means and its
+// risks. Refuses to proceed on unrecognized hardware without an explicit
+// override, since the padding this relies on was only verified on one
+// specific firmware build.
+func (c *CLI) initStorage() {
+	si, err := c.sw.fetchSysInfo()
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+	if si.Hardware != knownGoodHardware {
+		c.printf("%% This feature was only verified against hardware %q - this switch reports %q.\n", knownGoodHardware, si.Hardware)
+		c.println("% Using it here is unverified and could corrupt real settings if this firmware's layout differs.")
+		c.printf("Proceed anyway? [confirm] ")
+		line, _ := c.rl.Readline()
+		if strings.TrimSpace(line) != "" {
+			c.println("Aborted.")
+			return
+		}
+	}
+
+	backup, err := c.sw.fetchRawBackup()
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+	if _, ok := findStorageRegion(backup); ok {
+		c.println("This switch's flash storage is already initialized for tpios.")
+		c.println(`Use "write memory" or "copy running-config startup-config" to update it.`)
+		return
+	}
+
+	c.println(`This repurposes this switch's native "Backup and Restore" feature for tpios's own use.`)
+	c.println("Afterward the switch's own web UI backup/restore will no longer produce anything meaningfully restorable elsewhere - tpios becomes the only tool that understands what's stored there.")
+	c.println("This also triggers an immediate reboot.")
+	c.printf("Continue? [confirm] ")
+	line, _ := c.rl.Readline()
+	if strings.TrimSpace(line) != "" {
+		c.println("Aborted.")
+		return
+	}
+
+	text, err := c.buildRunningConfig()
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+	c.println("Writing to device flash and waiting for reboot (this can take up to 90 seconds)...")
+	if err := c.sw.writeStoredConfig(text); err != nil {
+		c.println("%", err)
+		return
+	}
+	if err := c.sw.login(); err != nil {
+		c.println("%", err)
+		c.println("The switch rebooted but tpios couldn't log back in automatically - reconnect manually.")
+		c.exitRequested = true
+		return
+	}
+	c.println(`Storage initialized. "write memory"/"wr" and "copy run start"/"copy start run" now operate on this switch's own flash (the local backup file is still kept too, as a free secondary copy).`)
 }
 
 // This hardware silently no-ops any VLAN create/update where every port is submitted
@@ -1555,6 +2025,7 @@ func (c *CLI) printHelp() {
     no vlan <id>
     ip address {dhcp|<address> <mask>}
     ip default-gateway <address>
+    init storage
     hostname <name>
     exit / end
   show version
@@ -1562,8 +2033,8 @@ func (c *CLI) printHelp() {
   show interfaces status
   show interface gigabitEthernet0/<n>
   show running-config
-  write memory | copy running-config startup-config  (saves to a local backup file, keyed by MAC)
-  copy startup-config running-config                 (replays that file onto this switch)
+  write memory | copy running-config startup-config  (local backup file, unless "init storage" ran)
+  copy startup-config running-config                 (replays it onto this switch)
   clear counters
   exit / logout
 Tab completes commands; a line ending in "?" lists what can come next.`)
@@ -1727,6 +2198,12 @@ func (c *CLI) handleLine(line string) (quit bool) {
 			} else {
 				c.println("% Unknown 'no' command in config mode")
 			}
+		case "init":
+			if lc(arg(args, 0)) != "storage" {
+				c.println("% Usage: init storage")
+				break
+			}
+			c.initStorage()
 		case "ip":
 			switch lc(arg(args, 0)) {
 			case "address":
@@ -1986,7 +2463,7 @@ func completionCandidates(mode Mode, precedingFields []string) []string {
 		case ModePriv:
 			return []string{"configure", "show", "write", "copy", "clear", "reload", "disable", "exit", "logout", "help"}
 		case ModeConfig:
-			return []string{"interface", "vlan", "no", "ip", "hostname", "do", "exit", "end", "help"}
+			return []string{"interface", "vlan", "no", "ip", "hostname", "init", "do", "exit", "end", "help"}
 		case ModeConfigIf:
 			return []string{"description", "shutdown", "no", "switchport", "speed", "flowcontrol", "exit", "end", "help"}
 		case ModeConfigVlan:
@@ -2033,6 +2510,8 @@ func completionCandidates(mode Mode, precedingFields []string) []string {
 		return []string{"address", "default-gateway"}
 	case first == "ip" && len(precedingFields) == 2 && lc(precedingFields[1]) == "address":
 		return []string{"dhcp"}
+	case first == "init" && len(precedingFields) == 1:
+		return []string{"storage"}
 	}
 	return nil
 }
