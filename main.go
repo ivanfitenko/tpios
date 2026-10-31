@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chzyer/readline"
@@ -693,7 +694,8 @@ type PortTarget struct {
 	TrunkVlans     []int
 	Description    string
 	HasDescription bool
-	pendingSpeed   string // holds "speed" until the following "duplex" line completes the pair
+	MACs           []string // populated by "refresh mac-address-table admin-port" - see refreshMacAddressTable
+	pendingSpeed   string   // holds "speed" until the following "duplex" line completes the pair
 }
 
 type ConfigTarget struct {
@@ -787,6 +789,8 @@ func parseConfigText(text string) *ConfigTarget {
 			case strings.HasPrefix(trimmed, "description "):
 				curPort.Description = strings.TrimPrefix(trimmed, "description ")
 				curPort.HasDescription = true
+			case strings.HasPrefix(trimmed, "mac "):
+				curPort.MACs = append(curPort.MACs, strings.TrimPrefix(trimmed, "mac "))
 			}
 		}
 	}
@@ -1075,10 +1079,11 @@ type CLI struct {
 	hostname      string
 	curIf         int
 	curVlan       int
-	pendingNames  map[int]string // vlan id -> name chosen before it has any port member (device can't persist an empty vlan)
-	descriptions  map[int]string // port -> description; this device has no field for it, so it only ever lives here and in the backup file
-	mac           string         // identifies the backup file for this switch (backupConfigPath)
-	connectIP     string         // the IP this session dialed - used to detect a replay changing it out from under us
+	pendingNames  map[int]string   // vlan id -> name chosen before it has any port member (device can't persist an empty vlan)
+	descriptions  map[int]string   // port -> description; this device has no field for it, so it only ever lives here and in the backup file
+	macAddrs      map[int][]string // port -> MAC(es) attributed to it by "refresh mac-address-table admin-port"; not read from the device - see refreshMacAddressTable
+	mac           string           // identifies the backup file for this switch (backupConfigPath)
+	connectIP     string           // the IP this session dialed - used to detect a replay changing it out from under us
 	out           *bufio.Writer
 	rl            *readline.Instance // needed for the "copy start run" confirm prompt
 	exitRequested bool               // set when a replay changes the IP/DHCP setting and this session's connection is now stale
@@ -1339,6 +1344,9 @@ func (c *CLI) renderIntDetail(ps *PortSettings, stats *PortStats, mac string, po
 	if desc, ok := c.descriptions[port]; ok && desc != "" {
 		c.printf("  Description: %s\n", desc)
 	}
+	if macs := c.macAddrs[port]; len(macs) > 0 {
+		c.printf("  MAC(s) seen on this port (via \"refresh mac-address-table\"): %s\n", strings.Join(macs, ", "))
+	}
 	c.printf("  Hardware is Gigabit Ethernet, address is %s (bia %s)\n", mac, mac)
 	c.println("  MTU 1500 bytes, BW 1000000 Kbit/sec, DLY 10 usec,")
 	c.println("     reliability 255/255, txload 1/255, rxload 1/255")
@@ -1500,6 +1508,9 @@ func (c *CLI) buildRunningConfig() (string, error) {
 		fmt.Fprintf(&b, "interface GigabitEthernet0/%d\n", p)
 		if desc, ok := c.descriptions[p]; ok && desc != "" {
 			fmt.Fprintf(&b, " description %s\n", desc)
+		}
+		for _, m := range c.macAddrs[p] {
+			fmt.Fprintf(&b, " mac %s\n", m)
 		}
 		if at(ps.State, p) == 0 {
 			fmt.Fprintln(&b, " shutdown")
@@ -1773,9 +1784,15 @@ func (c *CLI) applyConfigTarget(cfg *ConfigTarget) (ipChanged bool) {
 	if c.descriptions == nil {
 		c.descriptions = map[int]string{}
 	}
+	if c.macAddrs == nil {
+		c.macAddrs = map[int][]string{}
+	}
 	for p, pt := range cfg.Ports {
 		if pt.HasDescription {
 			c.descriptions[p] = pt.Description
+		}
+		if len(pt.MACs) > 0 {
+			c.macAddrs[p] = pt.MACs
 		}
 	}
 
@@ -1916,16 +1933,16 @@ func (c *CLI) bootLoadFromFlash() {
 	c.mergeLocalSessionState()
 }
 
-// mergeLocalSessionState overlays descriptions and pending VLAN names from
-// the local backup-config file on top of whatever bootLoadIfPresent/
-// bootLoadFromFlash just applied. These two fields have no home on the
-// device at all - not even in flash storage, until an explicit "write
-// memory" pushes them there too - while autoSaveLocal keeps the local file
-// current on every edit. That makes the local file always at least as fresh
-// as flash for exactly these two fields, even when flash is the primary,
-// device-resident source for everything else - without this, flash storage
-// being active meant any description/pending-VLAN-name edit since the last
-// "write memory" silently vanished on reconnect, the opposite of what
+// mergeLocalSessionState overlays descriptions, approximated MACs, and
+// pending VLAN names from the local backup-config file on top of whatever
+// bootLoadIfPresent/bootLoadFromFlash just applied. These fields have no
+// home on the device at all - not even in flash storage, until an explicit
+// "write memory" pushes them there too - while autoSaveLocal keeps the
+// local file current on every edit. That makes the local file always at
+// least as fresh as flash for exactly these fields, even when flash is the
+// primary, device-resident source for everything else - without this,
+// flash storage being active meant any such edit since the last "write
+// memory" silently vanished on reconnect, the opposite of what
 // autoSaveLocal exists for. Called unconditionally after either boot-load
 // path, including the local-file path itself, where it's a harmless no-op
 // (it's reading the exact file that was just applied).
@@ -1943,9 +1960,15 @@ func (c *CLI) mergeLocalSessionState() {
 	if c.descriptions == nil {
 		c.descriptions = map[int]string{}
 	}
+	if c.macAddrs == nil {
+		c.macAddrs = map[int][]string{}
+	}
 	for p, pt := range cfg.Ports {
 		if pt.HasDescription {
 			c.descriptions[p] = pt.Description
+		}
+		if len(pt.MACs) > 0 {
+			c.macAddrs[p] = pt.MACs
 		}
 	}
 
@@ -2197,6 +2220,487 @@ func (c *CLI) noSwitchportVlan(port, vid int) {
 	c.autoSaveLocal()
 }
 
+// ---------------------------- refresh mac-address-table admin-port (MAC-to-port) --
+//
+// This device exposes no MAC address table at all - no page in menuList.js
+// comes close (see concerns.md). "refresh mac-address-table admin-port
+// <n>" builds one anyway, entirely from the host machine tpios runs on:
+//
+//  1. arpSweep populates this host's own ARP table for the switch's
+//     subnet (candidate discovery only - not port attribution).
+//  2. localMACOnSubnet records this host's own MAC directly on adminPort
+//     (told to us, not guessed - see refreshMacAddressTable) - that port
+//     is never touched.
+//  3. For every other linked-up port: testPortReachability shuts it down
+//     briefly, checks which candidates went from reachable to
+//     unreachable, and always restores it before moving on.
+//
+// Three earlier designs tried to infer this from the switch's per-port
+// traffic counters instead (raw magnitude, then two different ways of
+// correcting for self-interference, then timing-pattern correlation) -
+// all failed to produce reliable results once validated against real,
+// already-known port assignments, because the actual signal was
+// consistently too weak relative to ordinary ambient traffic on a live
+// network to extract passively, no matter how the comparison was sliced.
+// See concerns.md for the full history - worth reading before attempting
+// another counter-based approach, since each one looked promising until
+// tested against real hardware.
+//
+// Results are stored exactly like descriptions: in c.macAddrs, persisted
+// to the local backup-config file (autoSaveLocal), round-tripped through
+// buildRunningConfig/parseConfigText as "mac <addr>" lines, and merged back
+// on reconnect by mergeLocalSessionState. They back "show mac
+// address-table".
+
+// hostIPsInSubnet returns every usable host address in ip/mask's subnet
+// (excluding the network and broadcast addresses), skipping exclude (the
+// switch's own address - not "a connected device" in the sense we care
+// about here).
+func hostIPsInSubnet(ip, mask, exclude string) ([]string, error) {
+	parsedIP := net.ParseIP(ip).To4()
+	parsedMask := net.IPMask(net.ParseIP(mask).To4())
+	if parsedIP == nil || parsedMask == nil {
+		return nil, fmt.Errorf("invalid subnet %s/%s", ip, mask)
+	}
+	network := parsedIP.Mask(parsedMask)
+	ones, bits := parsedMask.Size()
+	hostBits := bits - ones
+	if hostBits <= 0 || hostBits > 16 { // refuse anything bigger than a /16 - this is an active sweep, not built for huge ranges
+		return nil, fmt.Errorf("subnet too large to sweep (%d host bits)", hostBits)
+	}
+	count := uint32(1) << hostBits
+	base := binary.BigEndian.Uint32(network)
+	var ips []string
+	for i := uint32(1); i < count-1; i++ { // skip network (.0) and broadcast (all-ones)
+		addr := make(net.IP, 4)
+		binary.BigEndian.PutUint32(addr, base+i)
+		s := addr.String()
+		if s == exclude {
+			continue
+		}
+		ips = append(ips, s)
+	}
+	return ips, nil
+}
+
+// pokeARP forces the OS to resolve ip's MAC via ARP as a side effect of
+// attempting a TCP connection to it - the connection itself is expected to
+// fail or time out almost always; that's fine, we only care that the
+// kernel had to resolve the link-layer address before it could even
+// attempt the handshake. Pure net package, no subprocess, no raw sockets,
+// and - unlike ICMP ping on most platforms - no elevated privilege needed:
+// ping normally only works unprivileged because the system's own ping
+// binary is setuid-root (or uses an OS-granted unprivileged-ICMP
+// exception); a plain outbound TCP attempt needs neither.
+func pokeARP(ip string) {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "9"), 300*time.Millisecond)
+	if err == nil {
+		conn.Close()
+	}
+}
+
+// arpSweep calls pokeARP at every address concurrently (bounded worker
+// pool) purely to make the host OS resolve and cache ARP entries for
+// whatever responds. A host that filters inbound TCP but still answers ARP
+// is caught anyway, since ARP resolution happens before any IP packet -
+// SYN included - can even be sent, not after a reply comes back.
+func arpSweep(ips []string) {
+	const workers = 40
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for _, ip := range ips {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(ip string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			pokeARP(ip)
+		}(ip)
+	}
+	wg.Wait()
+}
+
+// readHostARPTable is implemented per-platform - see arp_darwin.go,
+// arp_linux.go, arp_other.go. All three return the same ip -> MAC shape.
+
+// normalizeMAC reformats a MAC address (e.g. loose hex with dropped
+// leading zeros per octet, as seen from macOS's "arp -an" historically)
+// into the consistent two-digit, colon-separated, uppercase form tpios
+// already uses elsewhere (e.g. "show version"'s System MAC Address).
+func normalizeMAC(mac string) string {
+	parts := strings.Split(mac, ":")
+	for i, p := range parts {
+		if len(p) == 1 {
+			parts[i] = "0" + p
+		}
+	}
+	return strings.ToUpper(strings.Join(parts, ":"))
+}
+
+// candidate is a MAC/IP pair discovered on the local LAN via arpSweep +
+// readHostARPTable, awaiting port attribution in refreshMacAddressTable.
+type candidate struct{ ip, mac string }
+
+// checkReachability is implemented per-platform - see arp_darwin.go
+// (real Layer-2 ARP-cache-invalidate-and-reresolve probing, immune to
+// host firewalls - see concerns.md) and arp_linux.go/arp_other.go (the
+// TCP-based fallback, tcpProbeReachable, on platforms with no privileged
+// probing path). All return ip -> reachable for every ip in ips, probed
+// as one batch (not one privilege-elevated call per IP).
+
+// tcpProbePorts is tried concurrently by tcpProbeReachable. A device with
+// any reasonable host firewall silently *drops* unsolicited connections
+// to an arbitrary closed port rather than rejecting them, so relying on
+// just one such port (confirmed live, originally just port 9) reads a
+// perfectly reachable, well-firewalled device as unreachable regardless
+// of actual link state. Trying a handful of commonly-open ports too
+// (SSH, HTTP, HTTPS, SMB) alongside one arbitrary one catches many more
+// real devices without needing them to run any specific service - only
+// whether *something* answers matters, not what. Still not as reliable
+// as the ARP-based probe in arp_darwin.go, which doesn't depend on the
+// target running anything at all.
+var tcpProbePorts = []string{"9", "22", "80", "443", "445"}
+
+// tcpProbeReachable reports whether ip answers on any of tcpProbePorts
+// within timeout - either a successful connection or a fast "connection
+// refused" both count, since either means something actually received
+// and responded to the packet; only every port timing out (no response
+// of any kind, from anything) means unreachable.
+func tcpProbeReachable(ip string, timeout time.Duration) bool {
+	results := make(chan bool, len(tcpProbePorts))
+	for _, port := range tcpProbePorts {
+		go func(port string) {
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), timeout)
+			if err == nil {
+				conn.Close()
+				results <- true
+				return
+			}
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				results <- false
+				return
+			}
+			results <- true // e.g. "connection refused" - the host answered
+		}(port)
+	}
+	reachable := false
+	for i := 0; i < len(tcpProbePorts); i++ {
+		if <-results {
+			reachable = true
+		}
+	}
+	return reachable
+}
+
+// localMACOnSubnet returns this host's own MAC address for whichever
+// network interface has an IP inside ip/mask's subnet - the interface
+// tpios itself must be using to reach the switch, since they're on the
+// same L2 segment. Used so the admin port can be recorded with certainty
+// instead of guessed at.
+func localMACOnSubnet(ip, mask string) (string, error) {
+	hosts, err := hostIPsInSubnet(ip, mask, "")
+	if err != nil {
+		return "", err
+	}
+	hostSet := map[string]bool{}
+	for _, h := range hosts {
+		hostSet[h] = true
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip4 := ipNet.IP.To4()
+			if ip4 == nil || !hostSet[ip4.String()] || len(iface.HardwareAddr) != 6 {
+				continue
+			}
+			mac := iface.HardwareAddr
+			return fmt.Sprintf("%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]), nil
+		}
+	}
+	return "", fmt.Errorf("could not determine this host's own MAC address on the switch's subnet")
+}
+
+// testPortReachability briefly shuts port down, checks which of
+// candidates went from reachable to unreachable, then always restores
+// the port's exact prior admin/speed/flowcontrol state before returning -
+// even on error, so a failure partway through can never strand a port
+// disabled. This is the deterministic alternative to counter-based
+// correlation (see concerns.md): not a signal to interpret, just "did
+// this specific device go unreachable when its link was cut."
+// errLostContact distinguishes "the switch itself became unreachable
+// mid-test" (almost always a self-inflicted lockout - see
+// refreshMacAddressTable's caller) from every other failure in
+// testPortReachability, which the caller reports more plainly.
+var errLostContact = errors.New("lost contact with switch")
+
+func (c *CLI) testPortReachability(port int, candidates []candidate, notify func(string)) (unreachable []candidate, err error) {
+	ps, err := c.sw.fetchPortSettings()
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]string, len(candidates))
+	for i, cand := range candidates {
+		ips[i] = cand.ip
+	}
+	before, err := checkReachability(ips, notify)
+	if err != nil {
+		return nil, fmt.Errorf("checking reachability: %w", err)
+	}
+
+	shutdownErr := c.sw.setPortState(port, 0, at(ps.SpdCfg, port), at(ps.FcCfg, port))
+	// The restore attempt must be registered before the shutdown call, not
+	// after it succeeds - a timeout *on this exact call* is a real,
+	// observed failure mode (confirmed live) when this port turns out to
+	// be the one carrying tpios's own connection: the switch can apply the
+	// change and the client can still time out waiting for the ack (the
+	// same "slow write, don't trust a client error as proof of failure"
+	// pattern already documented elsewhere in concerns.md for other CGI
+	// calls). Registering the defer only after a successful shutdown call
+	// meant that exact scenario - the one case where restoring matters
+	// most - skipped the restore attempt entirely.
+	defer func() {
+		if restoreErr := c.sw.setPortState(port, 1, at(ps.SpdCfg, port), at(ps.FcCfg, port)); restoreErr != nil {
+			c.printf("%% CRITICAL: failed to re-enable Gi0/%d after testing it - %s. Check it manually.\n", port, restoreErr)
+			return
+		}
+		// Best-effort wait for the link to actually come back up before
+		// moving on to the next port - avoids starting the next test while
+		// this one is still mid-renegotiation.
+		waitForLinkState(c.sw, port, true, 3*time.Second)
+	}()
+	if shutdownErr != nil {
+		return nil, fmt.Errorf("%w: %v", errLostContact, shutdownErr)
+	}
+	// A fixed short sleep here isn't enough: real Gigabit Ethernet PHY
+	// link teardown/renegotiation commonly takes 1-3 seconds, and testing
+	// reachability before the physical link has actually dropped means
+	// everything still looks fine regardless of what's really behind the
+	// port. Poll the switch's own actual link-state reading instead of
+	// guessing a delay, so the reachability test only starts once the
+	// link is confirmed down.
+	waitForLinkState(c.sw, port, false, 3*time.Second)
+
+	during, err := checkReachability(ips, notify)
+	if err != nil {
+		return nil, fmt.Errorf("checking reachability: %w", err)
+	}
+	for _, cand := range candidates {
+		if before[cand.ip] && !during[cand.ip] {
+			unreachable = append(unreachable, cand)
+		}
+	}
+	return unreachable, nil
+}
+
+// waitForLinkState polls fetchPortSettings until port's actual link state
+// (SpdAct nonzero == up) matches wantUp, or timeout elapses - whichever
+// comes first. Best-effort: a timeout here isn't treated as an error by
+// callers, just as "proceed anyway" - this is a sanity wait, not a
+// correctness gate the rest of the logic depends on.
+func waitForLinkState(sw *Switch, port int, wantUp bool, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ps, err := sw.fetchPortSettings()
+		if err == nil && (at(ps.SpdAct, port) != 0) == wantUp {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// refreshMacAddressTable is "refresh mac-address-table admin-port <n>" -
+// see the section comment above for the full technique and why it ended
+// up here after three counter-correlation designs all failed to produce
+// reliable results on a real, busy network. adminPort is this host's own
+// port, told to us rather than guessed at (guessing it via traffic
+// analysis, besides being yet another correlation problem, risked
+// disconnecting tpios from the switch entirely if ever wrong, with no
+// software-only way to recover): it's recorded directly with this host's
+// own MAC and never touched. Every other linked-up port gets shut down
+// one at a time, however briefly, to see what drops off - deliberately
+// not run automatically, only on explicit request, since it's genuinely
+// disruptive to whatever's plugged into each port under test.
+func (c *CLI) refreshMacAddressTable(adminPort int) {
+	// The leading newline matters: this fires from inside the per-port
+	// test loop too, where "  Testing Gi0/2..." has already been printed
+	// without a trailing newline (so its result can go on the same line) -
+	// without one, the notification visually runs together with it.
+	notify := func(msg string) { c.printf("\n%s\n", msg) }
+	if _, err := readHostARPTable(notify); err != nil {
+		c.println("%", err)
+		return
+	}
+
+	ipset, err := c.sw.fetchIPSetting()
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+
+	myMAC, err := localMACOnSubnet(ipset.IP, ipset.Mask)
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+	c.printf("Recording this host's own MAC (%s) on Gi0/%d - that port will never be touched.\n", myMAC, adminPort)
+
+	hosts, err := hostIPsInSubnet(ipset.IP, ipset.Mask, ipset.IP)
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+	c.printf("Sweeping %d addresses on %s/%s to populate ARP...\n", len(hosts), ipset.IP, ipset.Mask)
+	arpSweep(hosts)
+
+	arpTable, err := readHostARPTable(notify)
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+	hostSet := map[string]bool{}
+	for _, h := range hosts {
+		hostSet[h] = true
+	}
+	var candidates []candidate
+	for ip, mac := range arpTable {
+		if hostSet[ip] {
+			candidates = append(candidates, candidate{ip, mac})
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].ip < candidates[j].ip })
+
+	found := map[int][]string{adminPort: {myMAC}}
+	if len(candidates) == 0 {
+		c.println("No other devices found on the local subnet to test.")
+		c.macAddrs = found
+		c.autoSaveLocal()
+		return
+	}
+
+	ps, err := c.sw.fetchPortSettings()
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+	var testPorts []int
+	for p := 1; p <= c.sw.portNum; p++ {
+		if p == adminPort || at(ps.SpdAct, p) == 0 {
+			continue // never touch our own port, and nothing linked up means nothing to find
+		}
+		testPorts = append(testPorts, p)
+	}
+	if len(testPorts) == 0 {
+		c.println("No other linked-up ports to test.")
+		c.macAddrs = found
+		c.autoSaveLocal()
+		return
+	}
+	c.printf("Testing %d linked port(s) one at a time (briefly interrupts whatever's on each) - this will take a while...\n", len(testPorts))
+
+	remaining := candidates
+	for _, port := range testPorts {
+		if len(remaining) == 0 {
+			break
+		}
+		c.printf("  Testing Gi0/%d...", port)
+		unreachable, err := c.testPortReachability(port, remaining, notify)
+		if err != nil {
+			c.println()
+			if errors.Is(err, errLostContact) {
+				c.printf("%% Lost contact with the switch while testing Gi0/%d.\n", port)
+				c.println("% This almost always means that's actually this host's own connection, not the port given as admin-port - shutting it down cut tpios off from the switch.")
+				c.println("% The switch itself is very likely fine; reconnect (from this port once it's reachable again, or via another port/machine in the meantime) to check or fix its state.")
+				c.printf("%% (underlying error: %s)\n", err)
+			} else {
+				c.println("%", err)
+			}
+			return
+		}
+		if len(unreachable) == 0 {
+			c.println(" nothing behind it")
+			continue
+		}
+		var macs []string
+		for _, cand := range unreachable {
+			macs = append(macs, cand.mac)
+		}
+		found[port] = macs
+		c.printf(" %s\n", strings.Join(macs, ", "))
+
+		stillRemaining := remaining[:0:0]
+		for _, cand := range remaining {
+			attributed := false
+			for _, u := range unreachable {
+				if cand.ip == u.ip {
+					attributed = true
+					break
+				}
+			}
+			if !attributed {
+				stillRemaining = append(stillRemaining, cand)
+			}
+		}
+		remaining = stillRemaining
+	}
+
+	c.macAddrs = found
+	c.autoSaveLocal()
+
+	attributed := len(candidates) - len(remaining)
+	c.printf("Done: %d device(s) attributed to a port, %d left unattributed.\n", attributed, len(remaining))
+}
+
+// showMacAddressTable is "show mac address-table" / "show
+// mac-address-table" - previously a flat "not supported" stub, since this
+// device has no MAC table of its own at all. Now backed by whatever
+// "refresh mac-address-table admin-port <n>" has found (see the section
+// above). Still not real hardware-learned data, so the Type column says
+// "TESTED" rather than real IOS's "DYNAMIC"/"STATIC" - this was
+// determined by tpios itself (direct local lookup for the admin port,
+// link-down reachability testing for everything else), not learned by
+// switching hardware, and claiming otherwise would be misleading.
+func (c *CLI) showMacAddressTable() {
+	if len(c.macAddrs) == 0 {
+		c.println(`No MAC data yet - run "refresh mac-address-table admin-port <port>" first.`)
+		return
+	}
+	vt, err := c.sw.fetchVlans()
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+	pvids, err := c.sw.fetchPVIDs()
+	if err != nil {
+		c.println("%", err)
+		return
+	}
+	c.printf("%-6s %-18s %-8s %s\n", "Vlan", "Mac Address", "Type", "Ports")
+	c.printf("%-6s %-18s %-8s %s\n", "----", "-----------", "----", "-----")
+	ports := make([]int, 0, len(c.macAddrs))
+	for p := range c.macAddrs {
+		ports = append(ports, p)
+	}
+	sort.Ints(ports)
+	for _, p := range ports {
+		vlan := portVlanDisplay(vt, pvids, p)
+		for _, mac := range c.macAddrs[p] {
+			c.printf("%-6s %-18s %-8s Gi0/%d\n", vlan, mac, "TESTED", p)
+		}
+	}
+}
+
 func (c *CLI) printHelp() {
 	c.println(`Commands (not exhaustive - this is a toy):
   enable | disable
@@ -2227,8 +2731,10 @@ func (c *CLI) printHelp() {
   show interface gigabitEthernet0/<n>
   show running-config
   show backup-config
+  show mac address-table                             (see "refresh mac-address-table")
   write memory | copy running-config backup-config    (local backup file, unless "init storage" ran)
-  copy backup-config running-config                    (replays it onto this switch)
+  copy backup-config running-config                   (replays it onto this switch)
+  refresh mac-address-table admin-port <port>         (finds other ports by briefly testing each; <port> is yours and is never touched)
   clear counters
   exit / logout
 Tab completes commands; a line ending in "?" lists what can come next.`)
@@ -2267,7 +2773,7 @@ func (c *CLI) dispatchShow(args []string) {
 	case "start", "startup-config":
 		c.printStartupConfigBail()
 	case "mac", "mac-address-table":
-		c.println("% This command is not supported on this platform.")
+		c.showMacAddressTable()
 	default:
 		c.printf("%% Unknown show command: %s\n", arg(args, 0))
 	}
@@ -2368,6 +2874,23 @@ func (c *CLI) handleLine(line string) (quit bool) {
 			default:
 				c.println("% Usage: copy running-config backup-config | copy backup-config running-config")
 			}
+		case "refresh":
+			sub := resolveAbbrevIn(completionCandidates(ModePriv, []string{"refresh"}), lc(arg(args, 0)))
+			if sub != "mac-address-table" {
+				c.println("% Usage: refresh mac-address-table admin-port <port>")
+				break
+			}
+			sub2 := resolveAbbrevIn(completionCandidates(ModePriv, []string{"refresh", "mac-address-table"}), lc(arg(args, 1)))
+			if sub2 != "admin-port" {
+				c.println("% Usage: refresh mac-address-table admin-port <port>")
+				break
+			}
+			adminPort, perr := strconv.Atoi(arg(args, 2))
+			if perr != nil || adminPort < 1 || adminPort > c.sw.portNum {
+				c.printf("%% Invalid port: %s\n", arg(args, 2))
+				break
+			}
+			c.refreshMacAddressTable(adminPort)
 		case "reload":
 			c.println("Proceed with reload? [confirm]")
 			c.println("% reload is disabled in tpios for safety - power-cycle the switch physically if needed")
@@ -2415,7 +2938,7 @@ func (c *CLI) handleLine(line string) (quit bool) {
 				c.mode = ModeConfigVlan
 			}
 		case "no":
-			if lc(arg(args, 0)) == "vlan" {
+			if resolveAbbrevIn(completionCandidates(ModeConfig, []string{"no"}), lc(arg(args, 0))) == "vlan" {
 				vid, err := strconv.Atoi(arg(args, 1))
 				if err != nil {
 					c.printf("%% Invalid VLAN id: %s\n", arg(args, 1))
@@ -2540,7 +3063,7 @@ func (c *CLI) handleLine(line string) (quit bool) {
 				c.autoSaveLocal()
 			}
 		case "no":
-			switch lc(arg(args, 0)) {
+			switch resolveAbbrevIn(completionCandidates(ModeConfigIf, []string{"no"}), lc(arg(args, 0))) {
 			case "shutdown":
 				ps, err := c.sw.fetchPortSettings()
 				if err != nil {
@@ -2574,7 +3097,7 @@ func (c *CLI) handleLine(line string) (quit bool) {
 				delete(c.descriptions, c.curIf)
 				c.autoSaveLocal()
 			default:
-				c.println("% Unknown 'no' command in interface mode")
+				c.printf("%% Unknown 'no' command in interface mode: %q\n", arg(args, 0))
 			}
 		case "switchport":
 			switch lc(arg(args, 0)) {
@@ -2728,7 +3251,7 @@ func completionCandidates(mode Mode, precedingFields []string) []string {
 		case ModeUser:
 			return []string{"enable", "show", "exit", "logout", "help"}
 		case ModePriv:
-			return []string{"configure", "show", "write", "copy", "clear", "reload", "disable", "exit", "logout", "help"}
+			return []string{"configure", "show", "write", "copy", "refresh", "clear", "reload", "disable", "exit", "logout", "help"}
 		case ModeConfig:
 			return []string{"interface", "vlan", "no", "ip", "hostname", "init", "do", "exit", "end", "help"}
 		case ModeConfigIf:
@@ -2741,7 +3264,7 @@ func completionCandidates(mode Mode, precedingFields []string) []string {
 	first := lc(precedingFields[0])
 	switch {
 	case (first == "show" || first == "sh") && len(precedingFields) == 1:
-		return []string{"version", "vlan", "interfaces", "interface", "running-config", "backup-config", "startup-config"}
+		return []string{"version", "vlan", "interfaces", "interface", "running-config", "backup-config", "startup-config", "mac-address-table"}
 	case (first == "show" || first == "sh") && len(precedingFields) == 2 &&
 		(lc(precedingFields[1]) == "int" || lc(precedingFields[1]) == "interface" || lc(precedingFields[1]) == "interfaces"):
 		// Real IOS also lists interface-type keywords here (GigabitEthernet,
@@ -2767,6 +3290,11 @@ func completionCandidates(mode Mode, precedingFields []string) []string {
 		return []string{"show"}
 	case first == "clear" && len(precedingFields) == 1:
 		return []string{"counters"}
+	case (first == "refresh" || first == "ref") && len(precedingFields) == 1:
+		return []string{"mac-address-table"}
+	case (first == "refresh" || first == "ref") && len(precedingFields) == 2 &&
+		resolveAbbrevIn([]string{"mac-address-table"}, lc(precedingFields[1])) == "mac-address-table":
+		return []string{"admin-port"}
 	case first == "copy" && len(precedingFields) == 1:
 		return []string{"running-config", "backup-config", "startup-config"}
 	case first == "copy" && len(precedingFields) == 2 && lc(precedingFields[1]) == "running-config":
@@ -2840,6 +3368,7 @@ func (c *CLI) showLineHelp(prefixText string) {
 // ------------------------------------------------------------------- main() --
 
 func main() {
+	maybeHandleARPTableFlag() // see arp_darwin.go - no-op everywhere else
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [-ports N] <switch-ip>\n", os.Args[0])
 	}
