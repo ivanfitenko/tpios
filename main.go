@@ -1077,7 +1077,7 @@ type CLI struct {
 	sw            *Switch
 	mode          Mode
 	hostname      string
-	curIf         int
+	curIfs        []int // ports currently being configured - len 1 for "interface gi0/N", possibly more for "interface range ..."
 	curVlan       int
 	pendingNames  map[int]string   // vlan id -> name chosen before it has any port member (device can't persist an empty vlan)
 	descriptions  map[int]string   // port -> description; this device has no field for it, so it only ever lives here and in the backup file
@@ -1108,6 +1108,9 @@ func (c *CLI) prompt() string {
 	case ModeConfig:
 		return c.hostname + "(config)#"
 	case ModeConfigIf:
+		if len(c.curIfs) > 1 {
+			return c.hostname + "(config-if-range)#" // matches real IOS's distinct prompt for "interface range"
+		}
 		return c.hostname + "(config-if)#"
 	case ModeConfigVlan:
 		return c.hostname + "(config-vlan)#"
@@ -1136,6 +1139,69 @@ func parseIfName(s string) (int, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+// rangeDashRe splits one "interface range" group on its dash, tolerating
+// any amount of surrounding whitespace (real IOS accepts "gi0/1 - 5",
+// "gi0/1-5", and everything in between).
+var rangeDashRe = regexp.MustCompile(`\s*-\s*`)
+
+// parseInterfaceRange parses the argument to "interface range", e.g.
+// "gi0/1 - 5, gi0/8, gi0/10-12" - a comma-separated list of single
+// interfaces or dash-bounded ranges. Deliberately reuses parseIfName
+// (which already only looks at the trailing "/<N>", ignoring whatever
+// type prefix precedes it) rather than tracking interface-type prefixes
+// itself: since this device only ever has one interface type, a bare
+// number ("gi0/1 - 5, 8" meaning "..., gi0/8") already parses correctly
+// as a side effect, matching real IOS's "same type as the previous group
+// if omitted" behavior for free. Returns the resulting ports, deduplicated
+// and sorted - not necessarily contiguous or in the order typed, since
+// IOS's own "interface range" applies configuration in port-number order
+// regardless of how the ranges were listed.
+func parseInterfaceRange(raw string, portNum int) ([]int, error) {
+	seen := map[int]bool{}
+	var ports []int
+	add := func(p int) error {
+		if p < 1 || p > portNum {
+			return fmt.Errorf("invalid interface: port %d (valid ports are 1-%d)", p, portNum)
+		}
+		if !seen[p] {
+			seen[p] = true
+			ports = append(ports, p)
+		}
+		return nil
+	}
+	for _, group := range strings.Split(raw, ",") {
+		group = strings.TrimSpace(group)
+		if group == "" {
+			continue
+		}
+		parts := rangeDashRe.Split(group, 2)
+		start, ok := parseIfName(strings.TrimSpace(parts[0]))
+		if !ok {
+			return nil, fmt.Errorf("invalid interface: %q", strings.TrimSpace(parts[0]))
+		}
+		end := start
+		if len(parts) == 2 {
+			end, ok = parseIfName(strings.TrimSpace(parts[1]))
+			if !ok {
+				return nil, fmt.Errorf("invalid interface: %q", strings.TrimSpace(parts[1]))
+			}
+		}
+		if end < start {
+			return nil, fmt.Errorf("invalid range: end port %d is before start port %d", end, start)
+		}
+		for p := start; p <= end; p++ {
+			if err := add(p); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if len(ports) == 0 {
+		return nil, fmt.Errorf("no interfaces specified")
+	}
+	sort.Ints(ports)
+	return ports, nil
 }
 
 func lc(s string) string { return strings.ToLower(s) }
@@ -2706,6 +2772,7 @@ func (c *CLI) printHelp() {
   enable | disable
   configure terminal
     interface gigabitEthernet0/<1-N>
+    interface range <if1> [- <if2>][, <if3> [- <if4>]...]   (e.g. "int range gi0/1 - 5, gi0/8")
       description <text> / no description
       shutdown / no shutdown
       switchport mode {access|trunk}
@@ -2921,10 +2988,20 @@ func (c *CLI) handleLine(line string) (quit bool) {
 	case ModeConfig:
 		switch cmd {
 		case "int", "interface":
-			if lc(arg(args, 0)) == "range" {
-				c.println("% interface range is not supported in tpios yet")
+			if resolveAbbrevIn(completionCandidates(ModeConfig, []string{"interface"}), lc(arg(args, 0))) == "range" {
+				if len(args) < 2 {
+					c.println("% Usage: interface range <if1> [- <if2>][, <if3> [- <if4>]...]")
+					break
+				}
+				ports, err := parseInterfaceRange(strings.Join(args[1:], " "), c.sw.portNum)
+				if err != nil {
+					c.printf("%% %s\n", err)
+					break
+				}
+				c.curIfs = ports
+				c.mode = ModeConfigIf
 			} else if n, ok := parseIfName(arg(args, 0)); ok && n <= c.sw.portNum {
-				c.curIf = n
+				c.curIfs = []int{n}
 				c.mode = ModeConfigIf
 			} else {
 				c.printf("%% Invalid interface: %s\n", arg(args, 0))
@@ -3039,6 +3116,11 @@ func (c *CLI) handleLine(line string) (quit bool) {
 		}
 
 	case ModeConfigIf:
+		// Every command below applies to every port in c.curIfs - just one
+		// for a plain "interface gi0/N", possibly several for "interface
+		// range ...". Real IOS applies "interface range" commands in port-
+		// number order regardless of how the range was typed, which is why
+		// parseInterfaceRange already returns curIfs sorted.
 		switch cmd {
 		case "description":
 			if len(args) == 0 {
@@ -3048,7 +3130,10 @@ func (c *CLI) handleLine(line string) (quit bool) {
 			if c.descriptions == nil {
 				c.descriptions = map[int]string{}
 			}
-			c.descriptions[c.curIf] = strings.Join(args, " ")
+			desc := strings.Join(args, " ")
+			for _, p := range c.curIfs {
+				c.descriptions[p] = desc
+			}
 			c.autoSaveLocal()
 		case "shutdown":
 			ps, err := c.sw.fetchPortSettings()
@@ -3056,12 +3141,14 @@ func (c *CLI) handleLine(line string) (quit bool) {
 				c.println("%", err)
 				break
 			}
-			if err := c.sw.setPortState(c.curIf, 0, at(ps.SpdCfg, c.curIf), at(ps.FcCfg, c.curIf)); err != nil {
-				c.println("%", err)
-			} else {
-				c.printf("%%LINK-5-CHANGED: Interface GigabitEthernet0/%d, changed state to administratively down\n", c.curIf)
-				c.autoSaveLocal()
+			for _, p := range c.curIfs {
+				if err := c.sw.setPortState(p, 0, at(ps.SpdCfg, p), at(ps.FcCfg, p)); err != nil {
+					c.printf("%% Gi0/%d: %s\n", p, err)
+					continue
+				}
+				c.printf("%%LINK-5-CHANGED: Interface GigabitEthernet0/%d, changed state to administratively down\n", p)
 			}
+			c.autoSaveLocal()
 		case "no":
 			switch resolveAbbrevIn(completionCandidates(ModeConfigIf, []string{"no"}), lc(arg(args, 0))) {
 			case "shutdown":
@@ -3070,23 +3157,29 @@ func (c *CLI) handleLine(line string) (quit bool) {
 					c.println("%", err)
 					break
 				}
-				if err := c.sw.setPortState(c.curIf, 1, at(ps.SpdCfg, c.curIf), at(ps.FcCfg, c.curIf)); err != nil {
-					c.println("%", err)
-				} else {
-					c.printf("%%LINK-3-UPDOWN: Interface GigabitEthernet0/%d, changed state to up\n", c.curIf)
-					c.autoSaveLocal()
+				for _, p := range c.curIfs {
+					if err := c.sw.setPortState(p, 1, at(ps.SpdCfg, p), at(ps.FcCfg, p)); err != nil {
+						c.printf("%% Gi0/%d: %s\n", p, err)
+						continue
+					}
+					c.printf("%%LINK-3-UPDOWN: Interface GigabitEthernet0/%d, changed state to up\n", p)
 				}
+				c.autoSaveLocal()
 			case "switchport":
 				switch lc(arg(args, 1)) {
 				case "access":
 					if vid, err := strconv.Atoi(arg(args, 3)); err == nil {
-						c.noSwitchportVlan(c.curIf, vid)
+						for _, p := range c.curIfs {
+							c.noSwitchportVlan(p, vid)
+						}
 					} else {
 						c.println("% Usage: no switchport access vlan <id>")
 					}
 				case "trunk":
 					if vid, err := strconv.Atoi(arg(args, 4)); err == nil {
-						c.noSwitchportVlan(c.curIf, vid)
+						for _, p := range c.curIfs {
+							c.noSwitchportVlan(p, vid)
+						}
 					} else {
 						c.println("% Usage: no switchport trunk allowed vlan <id>")
 					}
@@ -3094,7 +3187,9 @@ func (c *CLI) handleLine(line string) (quit bool) {
 					c.println("% Usage: no switchport access vlan <id> | no switchport trunk allowed vlan <id>")
 				}
 			case "description":
-				delete(c.descriptions, c.curIf)
+				for _, p := range c.curIfs {
+					delete(c.descriptions, p)
+				}
 				c.autoSaveLocal()
 			default:
 				c.printf("%% Unknown 'no' command in interface mode: %q\n", arg(args, 0))
@@ -3111,7 +3206,9 @@ func (c *CLI) handleLine(line string) (quit bool) {
 			case "access":
 				if lc(arg(args, 1)) == "vlan" {
 					if vid, err := strconv.Atoi(arg(args, 2)); err == nil {
-						c.switchportAccess(c.curIf, vid)
+						for _, p := range c.curIfs {
+							c.switchportAccess(p, vid)
+						}
 					} else {
 						c.println("% Usage: switchport access vlan <id>")
 					}
@@ -3125,7 +3222,9 @@ func (c *CLI) handleLine(line string) (quit bool) {
 						v = arg(args, 4)
 					}
 					if vid, err := strconv.Atoi(v); err == nil {
-						c.switchportTrunkAdd(c.curIf, vid)
+						for _, p := range c.curIfs {
+							c.switchportTrunkAdd(p, vid)
+						}
 					} else {
 						c.println("% Usage: switchport trunk allowed vlan [add] <id>")
 					}
@@ -3156,11 +3255,12 @@ func (c *CLI) handleLine(line string) (quit bool) {
 				break
 			}
 			if code != 0 {
-				if err := c.sw.setPortState(c.curIf, at(ps.State, c.curIf), code, at(ps.FcCfg, c.curIf)); err != nil {
-					c.println("%", err)
-				} else {
-					c.autoSaveLocal()
+				for _, p := range c.curIfs {
+					if err := c.sw.setPortState(p, at(ps.State, p), code, at(ps.FcCfg, p)); err != nil {
+						c.printf("%% Gi0/%d: %s\n", p, err)
+					}
 				}
+				c.autoSaveLocal()
 			}
 		case "flowcontrol":
 			ps, err := c.sw.fetchPortSettings()
@@ -3178,17 +3278,18 @@ func (c *CLI) handleLine(line string) (quit bool) {
 				c.println("% Usage: flowcontrol {on|off}")
 				break
 			}
-			if err := c.sw.setPortState(c.curIf, at(ps.State, c.curIf), at(ps.SpdCfg, c.curIf), fc); err != nil {
-				c.println("%", err)
-			} else {
-				c.autoSaveLocal()
+			for _, p := range c.curIfs {
+				if err := c.sw.setPortState(p, at(ps.State, p), at(ps.SpdCfg, p), fc); err != nil {
+					c.printf("%% Gi0/%d: %s\n", p, err)
+				}
 			}
+			c.autoSaveLocal()
 		case "exit":
 			c.mode = ModeConfig
-			c.curIf = 0
+			c.curIfs = nil
 		case "end":
 			c.mode = ModePriv
-			c.curIf = 0
+			c.curIfs = nil
 		case "?", "help":
 			c.printHelp()
 		default:
@@ -3274,6 +3375,11 @@ func completionCandidates(mode Mode, precedingFields []string) []string {
 		return []string{"status", "description"}
 	case (first == "configure" || first == "conf") && len(precedingFields) == 1:
 		return []string{"terminal"}
+	case (first == "int" || first == "interface") && len(precedingFields) == 1 && mode == ModeConfig:
+		// A specific interface name/number isn't enumerable here (same
+		// limitation as "vlan <id>" below), so this only ever offers the
+		// one keyword candidate - "range".
+		return []string{"range"}
 	case first == "switchport" && len(precedingFields) == 1:
 		return []string{"mode", "access", "trunk"}
 	case first == "switchport" && len(precedingFields) == 2 && lc(precedingFields[1]) == "mode":
