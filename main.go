@@ -2971,7 +2971,109 @@ func resolveAbbrevIn(candidates []string, cmd string) string {
 	return cmd
 }
 
+// pipeFilter is one stage of a "| begin|include|exclude <pattern>" chain.
+type pipeFilter struct {
+	verb string // "begin", "include", or "exclude"
+	re   *regexp.Regexp
+}
+
+// handleLine is the readline entry point. Real IOS only accepts output
+// piping on EXEC-mode commands (show, more, dir, ...) - not while typing
+// config-mode lines, where a literal "|" can legitimately appear inside a
+// description or similar free-text argument. So piping is only recognized
+// in ModeUser/ModePriv; every other mode goes straight to the unfiltered
+// dispatch below, same as before this feature existed.
 func (c *CLI) handleLine(line string) (quit bool) {
+	if c.mode != ModeUser && c.mode != ModePriv || !strings.Contains(line, "|") {
+		return c.handleLineUnfiltered(line)
+	}
+
+	segments := strings.Split(line, "|")
+	base := strings.TrimSpace(segments[0])
+	if base == "" {
+		c.println("% Incomplete command.")
+		return false
+	}
+
+	filters := make([]pipeFilter, 0, len(segments)-1)
+	for _, seg := range segments[1:] {
+		trimmed := strings.TrimSpace(seg)
+		fields := strings.Fields(trimmed)
+		if len(fields) == 0 {
+			c.println("% Incomplete command.")
+			return false
+		}
+		verb := resolveAbbrevIn([]string{"begin", "include", "exclude"}, lc(fields[0]))
+		if verb != "begin" && verb != "include" && verb != "exclude" {
+			c.printf("%% Unknown filter %q (expected begin, include, or exclude)\n", fields[0])
+			return false
+		}
+		pattern := strings.TrimSpace(strings.TrimPrefix(trimmed, fields[0]))
+		if pattern == "" {
+			c.println("% Incomplete command.")
+			return false
+		}
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			c.printf("%% Bad regular expression %q: %v\n", pattern, err)
+			return false
+		}
+		filters = append(filters, pipeFilter{verb: verb, re: re})
+	}
+
+	origOut := c.out
+	var buf bytes.Buffer
+	c.out = bufio.NewWriter(&buf)
+	quit = c.handleLineUnfiltered(base)
+	c.out.Flush()
+	c.out = origOut
+
+	lines := strings.Split(buf.String(), "\n")
+	if n := len(lines); n > 0 && lines[n-1] == "" {
+		lines = lines[:n-1] // trailing newline from the captured output, not a real blank line
+	}
+	for _, f := range filters {
+		lines = applyPipeFilter(f, lines)
+	}
+	for _, ln := range lines {
+		c.println(ln)
+	}
+	return quit
+}
+
+// applyPipeFilter runs one begin/include/exclude stage over already-captured
+// output lines. "begin" matches real IOS: find the first matching line and
+// keep it plus everything after, or produce no output at all if nothing
+// ever matches - it does not fall back to showing the whole thing.
+func applyPipeFilter(f pipeFilter, lines []string) []string {
+	switch f.verb {
+	case "begin":
+		for i, ln := range lines {
+			if f.re.MatchString(ln) {
+				return lines[i:]
+			}
+		}
+		return nil
+	case "include":
+		kept := lines[:0:0]
+		for _, ln := range lines {
+			if f.re.MatchString(ln) {
+				kept = append(kept, ln)
+			}
+		}
+		return kept
+	default: // "exclude"
+		kept := lines[:0:0]
+		for _, ln := range lines {
+			if !f.re.MatchString(ln) {
+				kept = append(kept, ln)
+			}
+		}
+		return kept
+	}
+}
+
+func (c *CLI) handleLineUnfiltered(line string) (quit bool) {
 	fields := strings.Fields(line)
 	if len(fields) == 0 {
 		return false
