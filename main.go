@@ -708,6 +708,7 @@ type ConfigTarget struct {
 	LoopPrevention bool
 	VlanNames      map[int]string
 	Ports          map[int]*PortTarget
+	IfRangeMacros  map[string][]int // "define interface-range" macros - never written to the device, see CLI.ifRangeMacros
 }
 
 // parseConfigText understands exactly the dialect buildRunningConfig emits:
@@ -745,6 +746,16 @@ func parseConfigText(text string) *ConfigTarget {
 			cfg.IPGateway = strings.TrimPrefix(trimmed, "ip default-gateway ")
 		case !indented && trimmed == "loop-detection":
 			cfg.LoopPrevention = true
+		case !indented && strings.HasPrefix(trimmed, "define interface-range "):
+			fields := strings.Fields(strings.TrimPrefix(trimmed, "define interface-range "))
+			if len(fields) >= 2 {
+				if ports, err := parsePortRanges(strings.Join(fields[1:], " ")); err == nil {
+					if cfg.IfRangeMacros == nil {
+						cfg.IfRangeMacros = map[string][]int{}
+					}
+					cfg.IfRangeMacros[fields[0]] = ports
+				}
+			}
 		case !indented && strings.HasPrefix(trimmed, "vlan "):
 			if n, err := strconv.Atoi(strings.TrimPrefix(trimmed, "vlan ")); err == nil {
 				curVlanID = n
@@ -1082,6 +1093,7 @@ type CLI struct {
 	pendingNames  map[int]string   // vlan id -> name chosen before it has any port member (device can't persist an empty vlan)
 	descriptions  map[int]string   // port -> description; this device has no field for it, so it only ever lives here and in the backup file
 	macAddrs      map[int][]string // port -> MAC(es) attributed to it by "refresh mac-address-table admin-port"; not read from the device - see refreshMacAddressTable
+	ifRangeMacros map[string][]int // "define interface-range" macro name -> ports; purely a tpios-local naming convenience, never written to the device
 	mac           string           // identifies the backup file for this switch (backupConfigPath)
 	connectIP     string           // the IP this session dialed - used to detect a replay changing it out from under us
 	out           *bufio.Writer
@@ -1158,18 +1170,20 @@ var rangeDashRe = regexp.MustCompile(`\s*-\s*`)
 // and sorted - not necessarily contiguous or in the order typed, since
 // IOS's own "interface range" applies configuration in port-number order
 // regardless of how the ranges were listed.
-func parseInterfaceRange(raw string, portNum int) ([]int, error) {
+// parsePortRanges parses the Cisco range grammar (comma-separated single
+// interfaces or dash-bounded spans) with no upper-bound check - used both
+// by parseInterfaceRange (which adds one, for interactive use against a
+// live device) and by parseConfigText (which has no live device/port
+// count to check against when re-reading a "define interface-range" line
+// tpios itself already validated when it was written).
+func parsePortRanges(raw string) ([]int, error) {
 	seen := map[int]bool{}
 	var ports []int
-	add := func(p int) error {
-		if p < 1 || p > portNum {
-			return fmt.Errorf("invalid interface: port %d (valid ports are 1-%d)", p, portNum)
-		}
+	add := func(p int) {
 		if !seen[p] {
 			seen[p] = true
 			ports = append(ports, p)
 		}
-		return nil
 	}
 	for _, group := range strings.Split(raw, ",") {
 		group = strings.TrimSpace(group)
@@ -1192,9 +1206,7 @@ func parseInterfaceRange(raw string, portNum int) ([]int, error) {
 			return nil, fmt.Errorf("invalid range: end port %d is before start port %d", end, start)
 		}
 		for p := start; p <= end; p++ {
-			if err := add(p); err != nil {
-				return nil, err
-			}
+			add(p)
 		}
 	}
 	if len(ports) == 0 {
@@ -1202,6 +1214,46 @@ func parseInterfaceRange(raw string, portNum int) ([]int, error) {
 	}
 	sort.Ints(ports)
 	return ports, nil
+}
+
+func parseInterfaceRange(raw string, portNum int) ([]int, error) {
+	ports, err := parsePortRanges(raw)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range ports {
+		if p < 1 || p > portNum {
+			return nil, fmt.Errorf("invalid interface: port %d (valid ports are 1-%d)", p, portNum)
+		}
+	}
+	return ports, nil
+}
+
+// formatPortRanges is parsePortRanges's inverse: a sorted, deduplicated
+// port list back into Cisco's own compact range notation (consecutive
+// runs collapsed to "start - end", everything else comma-separated) -
+// used when emitting "define interface-range" lines in
+// buildRunningConfig, so a saved/reloaded macro round-trips back through
+// parsePortRanges to the identical port list.
+func formatPortRanges(ports []int) string {
+	sorted := append([]int(nil), ports...)
+	sort.Ints(sorted)
+	var groups []string
+	for i := 0; i < len(sorted); {
+		start, end := sorted[i], sorted[i]
+		j := i + 1
+		for j < len(sorted) && sorted[j] == end+1 {
+			end = sorted[j]
+			j++
+		}
+		if end == start {
+			groups = append(groups, fmt.Sprintf("GigabitEthernet0/%d", start))
+		} else {
+			groups = append(groups, fmt.Sprintf("GigabitEthernet0/%d - %d", start, end))
+		}
+		i = j
+	}
+	return strings.Join(groups, ", ")
 }
 
 func lc(s string) string { return strings.ToLower(s) }
@@ -1551,6 +1603,20 @@ func (c *CLI) buildRunningConfig() (string, error) {
 		fmt.Fprintln(&b, "loop-detection")
 	}
 	fmt.Fprintln(&b, "!")
+	if len(c.ifRangeMacros) > 0 {
+		// Purely a tpios-local naming convenience (see the CLI struct field
+		// comment) - never written to the device, just persisted locally so
+		// it survives a reconnect, same as descriptions/pendingNames/macAddrs.
+		names := make([]string, 0, len(c.ifRangeMacros))
+		for name := range c.ifRangeMacros {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			fmt.Fprintf(&b, "define interface-range %s %s\n", name, formatPortRanges(c.ifRangeMacros[name]))
+		}
+		fmt.Fprintln(&b, "!")
+	}
 	if vt.Enabled {
 		for _, v := range vt.Vlans {
 			if v.ID == 1 {
@@ -1861,6 +1927,14 @@ func (c *CLI) applyConfigTarget(cfg *ConfigTarget) (ipChanged bool) {
 			c.macAddrs[p] = pt.MACs
 		}
 	}
+	if len(cfg.IfRangeMacros) > 0 {
+		if c.ifRangeMacros == nil {
+			c.ifRangeMacros = map[string][]int{}
+		}
+		for name, ports := range cfg.IfRangeMacros {
+			c.ifRangeMacros[name] = ports
+		}
+	}
 
 	if cfg.Hostname != "" && cfg.Hostname != c.hostname {
 		if err := c.sw.setDeviceDescription(cfg.Hostname); err != nil {
@@ -2047,6 +2121,15 @@ func (c *CLI) mergeLocalSessionState() {
 			continue // already a real VLAN on the device - not pending
 		}
 		c.pendingNames[id] = name
+	}
+
+	if len(cfg.IfRangeMacros) > 0 {
+		if c.ifRangeMacros == nil {
+			c.ifRangeMacros = map[string][]int{}
+		}
+		for name, ports := range cfg.IfRangeMacros {
+			c.ifRangeMacros[name] = ports
+		}
 	}
 }
 
@@ -2773,6 +2856,7 @@ func (c *CLI) printHelp() {
   configure terminal
     interface gigabitEthernet0/<1-N>
     interface range <if1> [- <if2>][, <if3> [- <if4>]...]   (e.g. "int range gi0/1 - 5, gi0/8")
+    interface range macro <name>
       description <text> / no description
       shutdown / no shutdown
       switchport mode {access|trunk}
@@ -2786,6 +2870,8 @@ func (c *CLI) printHelp() {
       name <name>
       exit / end
     no vlan <id>
+    define interface-range <name> <if1> [- <if2>][, <if3> [- <if4>]...]
+    no define interface-range <name>
     ip address {dhcp|<address> <mask>}
     ip default-gateway <address>
     init storage
@@ -2988,9 +3074,21 @@ func (c *CLI) handleLine(line string) (quit bool) {
 	case ModeConfig:
 		switch cmd {
 		case "int", "interface":
-			if resolveAbbrevIn(completionCandidates(ModeConfig, []string{"interface"}), lc(arg(args, 0))) == "range" {
+			switch resolveAbbrevIn(completionCandidates(ModeConfig, []string{"interface"}), lc(arg(args, 0))) {
+			case "range":
+				if lc(arg(args, 1)) == "macro" {
+					name := arg(args, 2)
+					ports, ok := c.ifRangeMacros[name]
+					if !ok {
+						c.printf("%% Interface range macro %s not found\n", name)
+						break
+					}
+					c.curIfs = ports
+					c.mode = ModeConfigIf
+					break
+				}
 				if len(args) < 2 {
-					c.println("% Usage: interface range <if1> [- <if2>][, <if3> [- <if4>]...]")
+					c.println("% Usage: interface range <if1> [- <if2>][, <if3> [- <if4>]...] | interface range macro <name>")
 					break
 				}
 				ports, err := parseInterfaceRange(strings.Join(args[1:], " "), c.sw.portNum)
@@ -3000,11 +3098,13 @@ func (c *CLI) handleLine(line string) (quit bool) {
 				}
 				c.curIfs = ports
 				c.mode = ModeConfigIf
-			} else if n, ok := parseIfName(arg(args, 0)); ok && n <= c.sw.portNum {
-				c.curIfs = []int{n}
-				c.mode = ModeConfigIf
-			} else {
-				c.printf("%% Invalid interface: %s\n", arg(args, 0))
+			default:
+				if n, ok := parseIfName(arg(args, 0)); ok && n <= c.sw.portNum {
+					c.curIfs = []int{n}
+					c.mode = ModeConfigIf
+				} else {
+					c.printf("%% Invalid interface: %s\n", arg(args, 0))
+				}
 			}
 		case "vlan":
 			vid, err := strconv.Atoi(arg(args, 0))
@@ -3014,8 +3114,29 @@ func (c *CLI) handleLine(line string) (quit bool) {
 				c.curVlan = vid
 				c.mode = ModeConfigVlan
 			}
+		case "define":
+			if resolveAbbrevIn(completionCandidates(ModeConfig, []string{"define"}), lc(arg(args, 0))) != "interface-range" {
+				c.println("% Usage: define interface-range <name> <if1> [- <if2>][, <if3> [- <if4>]...]")
+				break
+			}
+			name := arg(args, 1)
+			if name == "" || len(args) < 3 {
+				c.println("% Usage: define interface-range <name> <if1> [- <if2>][, <if3> [- <if4>]...]")
+				break
+			}
+			ports, err := parseInterfaceRange(strings.Join(args[2:], " "), c.sw.portNum)
+			if err != nil {
+				c.printf("%% %s\n", err)
+				break
+			}
+			if c.ifRangeMacros == nil {
+				c.ifRangeMacros = map[string][]int{}
+			}
+			c.ifRangeMacros[name] = ports
+			c.autoSaveLocal()
 		case "no":
-			if resolveAbbrevIn(completionCandidates(ModeConfig, []string{"no"}), lc(arg(args, 0))) == "vlan" {
+			switch resolveAbbrevIn(completionCandidates(ModeConfig, []string{"no"}), lc(arg(args, 0))) {
+			case "vlan":
 				vid, err := strconv.Atoi(arg(args, 1))
 				if err != nil {
 					c.printf("%% Invalid VLAN id: %s\n", arg(args, 1))
@@ -3041,7 +3162,19 @@ func (c *CLI) handleLine(line string) (quit bool) {
 					c.printf("VLAN %d deleted\n", vid)
 					c.autoSaveLocal()
 				}
-			} else {
+			case "define":
+				if resolveAbbrevIn(completionCandidates(ModeConfig, []string{"no", "define"}), lc(arg(args, 1))) != "interface-range" {
+					c.println("% Usage: no define interface-range <name>")
+					break
+				}
+				name := arg(args, 2)
+				if _, ok := c.ifRangeMacros[name]; !ok {
+					c.printf("%% Interface range macro %s not found\n", name)
+					break
+				}
+				delete(c.ifRangeMacros, name)
+				c.autoSaveLocal()
+			default:
 				c.println("% Unknown 'no' command in config mode")
 			}
 		case "init":
@@ -3354,7 +3487,7 @@ func completionCandidates(mode Mode, precedingFields []string) []string {
 		case ModePriv:
 			return []string{"configure", "show", "write", "copy", "refresh", "clear", "reload", "disable", "exit", "logout", "help"}
 		case ModeConfig:
-			return []string{"interface", "vlan", "no", "ip", "hostname", "init", "do", "exit", "end", "help"}
+			return []string{"interface", "vlan", "no", "ip", "hostname", "init", "define", "do", "exit", "end", "help"}
 		case ModeConfigIf:
 			return []string{"description", "shutdown", "no", "switchport", "speed", "flowcontrol", "exit", "end", "help"}
 		case ModeConfigVlan:
@@ -3380,12 +3513,21 @@ func completionCandidates(mode Mode, precedingFields []string) []string {
 		// limitation as "vlan <id>" below), so this only ever offers the
 		// one keyword candidate - "range".
 		return []string{"range"}
+	case (first == "int" || first == "interface") && len(precedingFields) == 2 && lc(precedingFields[1]) == "range":
+		// A literal interface/range spec isn't enumerable either - "macro"
+		// is the one keyword candidate; a defined macro's name isn't, so
+		// typing it out is still required.
+		return []string{"macro"}
+	case first == "define" && len(precedingFields) == 1 && mode == ModeConfig:
+		return []string{"interface-range"}
 	case first == "switchport" && len(precedingFields) == 1:
 		return []string{"mode", "access", "trunk"}
 	case first == "switchport" && len(precedingFields) == 2 && lc(precedingFields[1]) == "mode":
 		return []string{"access", "trunk"}
 	case first == "no" && len(precedingFields) == 1 && mode == ModeConfig:
-		return []string{"vlan"}
+		return []string{"vlan", "define"}
+	case first == "no" && len(precedingFields) == 2 && mode == ModeConfig && lc(precedingFields[1]) == "define":
+		return []string{"interface-range"}
 	case first == "no" && len(precedingFields) == 1 && mode == ModeConfigIf:
 		return []string{"shutdown", "switchport", "description"}
 	case first == "speed" && len(precedingFields) == 1:
